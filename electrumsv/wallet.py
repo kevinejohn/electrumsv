@@ -1934,11 +1934,14 @@ class Multisig_Wallet(Deterministic_Wallet):
     # generic m of n
     gap_limit = 20
 
+    TYPE_BARE = "bare"
+    TYPE_P2SH = "p2sh"
+
     def __init__(self, parent_wallet: 'ParentWallet', wallet_data: Dict[str, Any]) -> None:
+        self.txin_type = wallet_data.get('txin_type', self.TYPE_P2SH)
         self.wallet_type = wallet_data.get('wallet_type')
         self.m, self.n = multisig_type(self.wallet_type)
         Deterministic_Wallet.__init__(self, parent_wallet, wallet_data)
-        self.txin_type = 'p2sh'
 
     def get_pubkeys(self, c, i):
         return self.derive_pubkeys(c, i)
