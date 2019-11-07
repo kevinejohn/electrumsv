@@ -25,7 +25,7 @@
 import threading
 
 from bitcoinx import (
-    BIP32PublicKey, BIP32Derivation, bip32_decompose_chain_string, Address, OP_RETURN_Output,
+    BIP32PublicKey, BIP32Derivation, bip32_decompose_chain_string, Address,
 )
 
 from electrumsv.app_state import app_state
@@ -402,10 +402,7 @@ class KeepKeyPlugin(HW_PluginBase):
                 address = classify_tx_output(tx_output)
                 if isinstance(address, Address):
                     txoutputtype.script_type = self.types.PAYTOADDRESS
-                    txoutputtype.address = address.to_string(coin=Net.COIN)
-                elif isinstance(address, OP_RETURN_Output):
-                    txoutputtype.script_type = self.types.PAYTOOPRETURN
-                    txoutputtype.op_return_data = bytes(tx_output.script_pubkey)[2:]
+                    txoutputtype.address = address.to_string()
 
             outputs.append(txoutputtype)
 

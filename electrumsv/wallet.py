@@ -50,10 +50,12 @@ from bitcoinx import (
 from . import coinchooser
 from . import paymentrequest
 from .app_state import app_state
-from .bitcoin import COINBASE_MATURITY
+from .bitcoin import COINBASE_MATURITY, address_from_string
+from .constants import TxFlags, ParentWalletKinds
 from .contacts import Contacts
 from .crypto import sha256d
-from .exceptions import NotEnoughFunds, ExcessiveFee, UserCancelled, InvalidPassword
+from .exceptions import (NotEnoughFunds, ExcessiveFee, UserCancelled, InvalidPassword,
+    UnknownTransactionException)
 from .i18n import _
 from .keystore import (load_keystore, Hardware_KeyStore, Imported_KeyStore, BIP32_KeyStore,
     KeyStore)
@@ -61,22 +63,17 @@ from .logs import logs
 from .networks import Net
 from .paymentrequest import InvoiceStore
 from .paymentrequest import PR_PAID, PR_UNPAID, PR_UNKNOWN, PR_EXPIRED
-from .storage import multisig_type, WalletStorage, ParentWalletKinds
+from .storage import multisig_type, WalletStorage
 from .transaction import (
     Transaction, classify_tx_output, tx_output_to_display_text, XPublicKey, NO_SIGNATURE,
     XTxInput
 )
-from .wallet_database import WalletData, DBTxInput, DBTxOutput, TxFlags, TxData, TxProof
-from .util import profiler, format_satoshis, bh2u, format_time, timestamp_to_datetime
+from .wallet_database import WalletData, DBTxInput, DBTxOutput, TxData, TxProof
+from .util import (profiler, format_satoshis, bh2u, format_time, timestamp_to_datetime,
+    get_wallet_name_from_path)
 from .web import create_URI
 
 logger = logs.get_logger("wallet")
-
-
-class WalletTypes:
-    STANDARD = "standard"
-    MULTISIG = "multisig"
-    IMPORTED = "imported"
 
 
 TxInfo = namedtuple('TxInfo', 'hash status label can_broadcast amount '
@@ -108,7 +105,7 @@ class UTXO:
         return ':'.join((self.tx_hash, str(self.out_index)))
 
     def to_tx_input(self):
-        kind = classify_output_script(self.script_pubkey)
+        kind = classify_output_script(self.script_pubkey, Net.COIN)
         if isinstance(kind, P2PKH_Address):
             threshold = 1
             # _add_input_sig_info() will replace with public key
@@ -215,7 +212,7 @@ class Abstract_Wallet:
 
         # Database Id for this child wallet.
         self._id = wallet_data["id"]
-        self._datastore = parent_wallet.get_wallet_datastore(self._id)
+        self._open_database()
 
         self.logger = logs.get_logger("wallet[{}]".format(self.name()))
         self.network = None
@@ -245,7 +242,7 @@ class Abstract_Wallet:
         # load requests
         requests = wallet_data.get('payment_requests', {})
         for key, req in requests.items():
-            req['address'] = Address.from_string(key)
+            req['address'] = address_from_string(key)
         self.receive_requests = {req['address']: req
                                  for req in requests.values()}
 
@@ -267,6 +264,11 @@ class Abstract_Wallet:
         instance = klass(parent_wallet, wallet_data)
         parent_wallet.add_child_wallet(instance)
         return instance
+
+    def _open_database(self, close_existing: bool=False) -> None:
+        if close_existing:
+            self._datastore.close()
+        self._datastore = self._parent_wallet.get_wallet_datastore(self._id)
 
     def is_wrapped_legacy_wallet(self):
         return True
@@ -329,7 +331,7 @@ class Abstract_Wallet:
     @classmethod
     def to_Address_dict(cls, d):
         '''Convert a dict of strings to a dict of Adddress objects.'''
-        return {Address.from_string(text): value for text, value in d.items()}
+        return {address_from_string(text): value for text, value in d.items()}
 
     @classmethod
     def from_Address_dict(cls, d):
@@ -375,9 +377,6 @@ class Abstract_Wallet:
         # paradigm. It needs to share access in that case. It is possible the parent wallet needs
         # to be the place where it is obtained. Each child wallet can hold a reference.
 
-        self.pending_txs = self._datastore.tx.get_transactions(TxFlags.StateSigned,
-            TxFlags.STATE_MASK)
-
         # address -> list(txid, height)
         addr_history = self._datastore.misc.get_value('addr_history')
         self._history = self.to_Address_dict(addr_history) if addr_history is not None else {}
@@ -392,7 +391,7 @@ class Abstract_Wallet:
         self._frozen_addresses = set([])
         frozen_addresses = self._datastore.misc.get_value('frozen_addresses')
         if frozen_addresses is not None:
-            self._frozen_addresses = set(Address.from_string(addr) for addr in frozen_addresses)
+            self._frozen_addresses = set(address_from_string(addr) for addr in frozen_addresses)
 
         # Frozen coins (UTXOs) -- note that we have 2 independent
         # levels of "freezing": address-level and coin-level.  The two
@@ -410,17 +409,13 @@ class Abstract_Wallet:
         # If there was no address history entry we can take this as representative that there
         # are no other entries because the wallet has not been saved yet. This is not the case
         # with addresses, but otherwise so.
-        self._insert = addr_history is None
-        self.logger.debug("load_external_data insert=%r", self._insert)
+        _insert = addr_history is None
+        self.logger.debug("load_external_data insert=%r", _insert)
 
     @profiler
     def save_external_data(self):
         with self.transaction_lock:
-            if self._insert:
-                save_func = self._datastore.misc.add
-            else:
-                save_func = self._datastore.misc.update
-
+            save_func = self._datastore.misc.set
             save_func('pruned_txo', [ [ list(k), v ] for (k, v) in self.pruned_txo.items() ])
             save_func('frozen_addresses',
                 list(addr.to_string() for addr in self._frozen_addresses))
@@ -431,32 +426,33 @@ class Abstract_Wallet:
             if address_data is not None:
                 save_func('addresses', address_data)
 
-    def get_tx_ids_for_address(self, address: Address) -> List[str]:
-        address_string = address.to_string()
-        tx_ids = set([])
-        for tx_id, entries in self._datastore.txin.get_all_entries().items():
-            for entry in entries:
-                if entry.address_string == address_string:
-                    tx_ids.add(tx_id)
-        for tx_id, entries in self._datastore.txout.get_all_entries().items():
-            for entry in entries:
-                if entry.address_string == address_string:
-                    tx_ids.add(tx_id)
-        return tx_ids
-
-    def get_txins(self, tx_id: str, address: Optional[Address]=None) -> List[DBTxInput]:
+    def get_txins(self, tx_id: str, address: Optional[Address]=None,
+            address_string: Optional[str]=None) -> List[DBTxInput]:
         entries = self._datastore.txin.get_entries(tx_id)
         if address is None:
             return entries
-        address_string = address.to_string()
+        if address_string is None:
+            address_string = address.to_string()
         return [ v for v in entries if v.address_string == address_string ]
 
-    def get_txouts(self, tx_id: str, address: Optional[str]=None) -> List[DBTxOutput]:
+    def get_txouts(self, tx_id: str, address: Optional[Address]=None,
+            address_string: Optional[str]=None) -> List[DBTxOutput]:
         entries = self._datastore.txout.get_entries(tx_id)
         if address is None:
             return entries
-        address_string = address.to_string()
+        if address_string is None:
+            address_string = address.to_string()
         return [ v for v in entries if v.address_string == address_string ]
+
+    def is_coinbase_transaction(self, tx_id: str) -> bool:
+        # TODO(rt12): This is not as accurate as it needs to be. It only notes if the transaction
+        # does coinbase outputs to the wallet, not if the transaction has a coinbase input in
+        # general.
+        tx_outs = self.get_txouts(tx_id)
+        return len(tx_outs) and tx_outs[0].is_coinbase
+
+    def have_transaction_data(self, tx_id: str) -> bool:
+        return self._datastore.tx.have_transaction_data(tx_id)
 
     def get_transaction(self, tx_id: str, flags: Optional[int]=None) -> Optional[Transaction]:
         return self._datastore.tx.get_transaction(tx_id, flags)
@@ -464,7 +460,7 @@ class Abstract_Wallet:
     def has_received_transaction(self, tx_id: str) -> bool:
         # At this time, this means received over the P2P network.
         flags = self._datastore.tx.get_flags(tx_id)
-        return flags is not None and (flags & (TxFlags.StateSettled | TxFlags.StateCleared)) != 0
+        return flags is not None and (flags & (TxFlags.StateCleared | TxFlags.StateSettled)) != 0
 
     def display_name(self) -> str:
         # TODO: ACCOUNTS: Allow user to change this.
@@ -485,9 +481,9 @@ class Abstract_Wallet:
     def load_addresses(self, data: dict) -> None:
         if data is None:
             data = {}
-        self.receiving_addresses = [Address.from_string(addr)
+        self.receiving_addresses = [address_from_string(addr)
                                     for addr in data.get('receiving', [])]
-        self.change_addresses = [Address.from_string(addr)
+        self.change_addresses = [address_from_string(addr)
                                  for addr in data.get('change', [])]
 
     def is_deterministic(self):
@@ -553,7 +549,7 @@ class Abstract_Wallet:
         return self.get_pubkeys(*sequence)
 
     def add_verified_tx(self, tx_hash, height, timestamp, position, proof_position, proof_branch):
-        entry = self._datastore.tx.get_entry(tx_hash, TxFlags.StateSettled)
+        entry = self._datastore.tx.get_entry(tx_hash, TxFlags.StateCleared)
         # Ensure we are not verifying transactions multiple times.
         if entry is None:
             entry = self._datastore.tx.get_entry(tx_hash)
@@ -564,7 +560,7 @@ class Abstract_Wallet:
         # We only update a subset.
         flags = TxFlags.HasHeight | TxFlags.HasTimestamp | TxFlags.HasPosition
         data = TxData(height=height, timestamp=timestamp, position=position)
-        self._datastore.tx.update([ (tx_hash, data, None, flags | TxFlags.StateCleared) ])
+        self._datastore.tx.update([ (tx_hash, data, None, flags | TxFlags.StateSettled) ])
 
         proof = TxProof(proof_position, proof_branch)
         self._datastore.tx.update_proof(tx_hash, proof)
@@ -573,7 +569,7 @@ class Abstract_Wallet:
         self.logger.debug("add_verified_tx %d %d %d", height, conf, timestamp)
         self.network.trigger_callback('verified', tx_hash, height, conf, timestamp)
 
-        addresses = [ Address.from_string(entry.address_string)
+        addresses = [ address_from_string(entry.address_string)
             for entry in self.get_txins(tx_hash) ]
         self._check_used_addresses(addresses)
 
@@ -641,7 +637,7 @@ class Abstract_Wallet:
         is_mine = False
         is_pruned = False
         is_partial = False
-        v_in = v_out = v_out_mine = 0
+        v_in_mine = v_out = v_out_mine = 0
         for txin in tx.inputs:
             addr = txin.address
             if addr in addresses:
@@ -656,7 +652,7 @@ class Abstract_Wallet:
                 if value is None:
                     is_pruned = True
                 else:
-                    v_in += value
+                    v_in_mine += value
             else:
                 is_partial = True
         if not is_mine:
@@ -667,24 +663,13 @@ class Abstract_Wallet:
             if addr in addresses:
                 v_out_mine += tx_output.value
                 is_relevant = True
-        if is_pruned:
-            # some inputs are mine:
+        v = v_out_mine - v_in_mine
+        if not is_mine or is_pruned or is_partial:
+            # None or only some inputs are mine, but not all
             fee = None
-            if is_mine:
-                v = v_out_mine - v_out
-            else:
-                # no input is mine
-                v = v_out_mine
         else:
-            v = v_out_mine - v_in
-            if is_partial:
-                # some inputs are mine, but not all
-                fee = None
-            else:
-                # all inputs are mine
-                fee = v_in - v_out
-        if not is_mine:
-            fee = None
+            # all inputs are mine
+            fee = v_in_mine - v_out
         return is_relevant, is_mine, v, fee
 
     # Only called from the history ui dialog.
@@ -731,16 +716,19 @@ class Abstract_Wallet:
                       height, conf, timestamp)
 
     def _get_addr_io(self, address):
-        h = self.get_address_history(address)
-        received = {}
-        for tx_hash, height in h:
-            for txout in self.get_txouts(tx_hash, address):
-                received[(tx_hash, txout.out_tx_n)] = (height, txout.amount, txout.is_coinbase)
-        sent = {}
-        for tx_hash, height in h:
-            for txin in self.get_txins(tx_hash, address):
-                sent[(txin.prevout_tx_hash, txin.prev_idx)] = height
-        return received, sent
+        # Ensure that we do not hit a race condition with the `_update_transaction_xputs` function
+        with self.transaction_lock:
+            h = self.get_address_history(address)
+            address_string = address.to_string()
+            received = {}
+            for tx_hash, height in h:
+                for txout in self.get_txouts(tx_hash, address, address_string):
+                    received[(tx_hash, txout.out_tx_n)] = (height, txout.amount, txout.is_coinbase)
+            sent = {}
+            for tx_hash, height in h:
+                for txin in self.get_txins(tx_hash, address, address_string):
+                    sent[(txin.prevout_tx_hash, txin.prev_idx)] = height
+            return received, sent
 
     def is_frozen_utxo(self, utxo):
         return utxo.key() in self._frozen_coins
@@ -765,9 +753,11 @@ class Abstract_Wallet:
 
     # return the total amount ever received by an address
     def get_addr_received(self, address):
+        address_string = address.to_string()
         received_amount = 0
         for tx_hash, height in self.get_address_history(address):
-            received_amount += sum(txout.amount for txout in self.get_txouts(tx_hash, address))
+            received_amount += sum(txout.amount for txout in self.get_txouts(tx_hash, address,
+                address_string))
         return received_amount
 
     # return the balance of a bitcoin address: confirmed and matured,
@@ -872,20 +862,18 @@ class Abstract_Wallet:
             xx += x
         return cc, uu, xx
 
-    def get_address_history(self, address: Address):
-        assert isinstance(address, Address)
-        return self._history.get(address, [])
-
-    def add_pending_transaction(self, tx_hash: str, tx: Transaction) -> None:
-        with self.transaction_lock:
-            # freeze the inputs.
-            pass
-
-    def add_transaction(self, tx_hash: str, tx: Transaction) -> None:
+    def add_transaction(self, tx_hash: str, tx: Transaction, flag: TxFlags) -> None:
         with self.transaction_lock:
             self._update_transaction_xputs(tx_hash, tx)
-            self.logger.debug("adding tx data %s", tx_hash)
-            self._datastore.tx.add_transaction(tx, TxFlags.StateSettled)
+            self.logger.debug("adding tx data %s (flags: %s)", tx_hash, TxFlags.to_repr(flag))
+            self._datastore.tx.add_transaction(tx, flag)
+
+    def set_transaction_state(self, tx_hash: str, flag: TxFlags) -> bool:
+        """ raises UnknownTransactionException """
+        with self.transaction_lock:
+            if not self._datastore.tx.is_cached(tx_hash):
+                raise UnknownTransactionException(f"tx {tx_hash} unknown")
+            self._datastore.tx.update_flags(tx_hash, flag)
 
     def apply_transactions_xputs(self, tx_hash: str, tx: Transaction) -> None:
         with self.transaction_lock:
@@ -896,7 +884,7 @@ class Abstract_Wallet:
         # We batch the adding of inputs and outputs as it is a thousand times faster.
         txins = []
         txouts = []
-        addresses = set([])
+        affected_addresses = set()
 
         # add inputs
         for tx_input in tx.inputs:
@@ -910,18 +898,19 @@ class Abstract_Wallet:
                 if match is not None:
                     txin = DBTxInput(address.to_string(), prev_hash_hex, prev_idx, match.amount)
                     txins.append((tx_hash, txin))
+                    affected_addresses.add(address)
                 else:
                     self.pruned_txo[(prev_hash_hex, prev_idx)] = tx_hash
-                addresses.add(address)
 
         # add outputs
         for n, tx_output in enumerate(tx.outputs):
+            # This address will not be linked to the coin.
             address = classify_tx_output(tx_output)
             if isinstance(address, Address) and self.is_mine(address):
-                txout = DBTxOutput(address.to_string(coin=Net.COIN), n,
+                txout = DBTxOutput(address.to_string(), n,
                                    tx_output.value, is_coinbase)
                 txouts.append((tx_hash, txout))
-                addresses.add(address)
+                affected_addresses.add(address)
 
             # give the value to txi that spends me
             next_tx_hash = self.pruned_txo.get((tx_hash, n))
@@ -930,6 +919,7 @@ class Abstract_Wallet:
 
                 txin = DBTxInput(address.to_string(), tx_hash, n, tx_output.value)
                 txins.append((next_tx_hash, txin))
+                affected_addresses.add(address)
 
         # We expect to be passing in existing entries as this gets recalled for a transaction
         # by the history code, and we do not filter them out above.
@@ -938,13 +928,16 @@ class Abstract_Wallet:
         if txouts:
             self._datastore.txout.add_entries(txouts)
 
+        if len(affected_addresses):
+            self.network.trigger_callback('on_addresses_updated', affected_addresses)
+
     # Used by ImportedWalletBase
     def _remove_transaction(self, tx_hash: str) -> None:
         with self.transaction_lock:
             self.logger.debug("removing tx from history %s", tx_hash)
 
-            for out_key, next_tx_hash in list(self.pruned_txo.items()):
-                if next_tx_hash == tx_hash:
+            for out_key, input_tx_hash in list(self.pruned_txo.items()):
+                if input_tx_hash == tx_hash:
                     self.pruned_txo.pop(out_key)
 
             # add tx to pruned_txo, and undo the txi addition
@@ -960,11 +953,21 @@ class Abstract_Wallet:
 
             removal_txouts = self.get_txouts(tx_hash)
             if len(removal_txouts):
-                self._datastore.txout.delete_entries(removal_txouts)
+                self._datastore.txout.delete_entries(
+                    [ (tx_hash, tx_xput) for tx_xput in removal_txouts ])
 
-    async def set_address_history(self, addr, hist, tx_fees):
+    def get_address_history(self, address: Address):
+        assert isinstance(address, Address)
+        return self._history.get(address, [])
+
+    async def set_address_history(self, script_hash: str, address: Address,
+            hist: Dict[str, List[Tuple[str, int]]], tx_fees: Dict[str, int]):
         with self.lock:
-            self._history[addr] = hist # { address: (tx_hash, tx_height) }
+            # { address: [ (tx_hash, tx_height), ] }
+            # height > 0: confirmed
+            # height = 0: unconfirmed
+            # height < 0: unconfirmed with unconfirmed parents
+            self._history[address] = hist
 
             updates = []
             for tx_hash, tx_height in hist:
@@ -978,16 +981,15 @@ class Abstract_Wallet:
 
             for tx_id in set(t[0] for t in hist):
                 # if addr is new, we have to recompute txi and txo
-                tx = self.get_transaction(tx_id)
-                if (tx is not None and not len(self.get_txins(tx_id, addr)) and
-                        not len(self.get_txouts(tx_id, addr))):
+                if self._datastore.tx.have_transaction_data(tx_id) and \
+                        not len(self.get_txins(tx_id, address)) and \
+                        not len(self.get_txouts(tx_id, address)):
+                    tx = self.get_transaction(tx_id)
                     self.apply_transactions_xputs(tx_id, tx)
 
         self.txs_changed_event.set()
         await self._trigger_synchronization()
 
-    # Called by wallet.py:export_history()
-    # Called by history_list.py:on_update()
     def get_history(self, domain=None):
         # get domain
         if domain is None:
@@ -1076,6 +1078,9 @@ class Abstract_Wallet:
             out.append(item)
         return out
 
+    def get_address_label(self, address_text: str) -> Optional[str]:
+        return self.labels.get(address_text, '')
+
     def get_label(self, tx_hash):
         label = self.labels.get(tx_hash, '')
         if label == '':
@@ -1086,7 +1091,7 @@ class Abstract_Wallet:
         if not len(self.get_txins(tx_hash)):
             labels = []
             for txout in self.get_txouts(tx_hash):
-                label = self.labels.get(txout.address_string)
+                label = self.get_address_label(txout.address_string)
                 if label:
                     labels.append(label)
             return ', '.join(labels)
@@ -1130,7 +1135,7 @@ class Abstract_Wallet:
                 if not change_addrs:
                     change_addrs = [random.choice(addrs)]
             else:
-                change_addrs = [inputs[0]['address']]
+                change_addrs = [inputs[0].address]
 
         assert all(isinstance(addr, Address) for addr in change_addrs)
 
@@ -1143,7 +1148,7 @@ class Abstract_Wallet:
         if all_index is None:
             # Let the coin chooser select the coins to spend
             max_change = self.max_change_outputs if self.multiple_change else 1
-            coin_chooser = coinchooser.CoinChooserPrivacy()
+            coin_chooser = coinchooser.CoinChooserRandom()
             tx = coin_chooser.make_tx(inputs, outputs, change_addrs[:max_change],
                                       fee_estimator, self.dust_threshold())
         else:
@@ -1233,12 +1238,9 @@ class Abstract_Wallet:
         return not any(self.get_addr_balance(address))
 
     def is_confirmed_address(self, address: Address) -> bool:
-        # Knowing this address has been used, is all usage finalised?
-        for tx_id in self.get_tx_ids_for_address(address):
-            metadata = self._datastore.tx.get_cached_entry(tx_id).metadata
-            if metadata.height is not None and metadata.height >= 0:
-                return True
-        return False
+        # If all the transactions that are related to the given address have at least one
+        # confirmation, then the address is considered confirmed.
+        return all(tx_data[1] > 0 for tx_data in self.get_address_history(address))
 
     def cpfp(self, tx, fee):
         txid = tx.txid()
@@ -1313,6 +1315,7 @@ class Abstract_Wallet:
     def sign_transaction(self, tx: Transaction, password: str) -> None:
         if self.is_watching_only():
             return
+
         # hardware wallets require extra info
         if any([(isinstance(k, Hardware_KeyStore) and k.can_sign(tx))
                 for k in self.get_keystores()]):
@@ -1324,6 +1327,11 @@ class Abstract_Wallet:
                     k.sign_transaction(tx, password)
             except UserCancelled:
                 continue
+
+        # # Track all the transactions we sign so that we know whether our UTXOs are allocated for
+        # # use or not.
+        # tx_id = tx.txid()
+        # self.add_transaction(tx_id, tx, TxFlags.StateSigned)
 
     def get_unused_addresses(self):
         # fixme: use slots from expired requests
@@ -1489,7 +1497,7 @@ class Abstract_Wallet:
 
     def remove_payment_request(self, addr, config):
         if isinstance(addr, str):
-            addr = Address.from_string(addr)
+            addr = address_from_string(addr)
         if addr not in self.receive_requests:
             return False
         r = self.receive_requests.pop(addr)
@@ -1524,17 +1532,17 @@ class Abstract_Wallet:
     def can_delete_address(self):
         return False
 
-    def _add_new_addresses(self, addresses: Iterable[Address], *, save: bool=True):
+    def _add_new_addresses(self, addresses: Iterable[Address], for_change: bool=False):
         assert all(isinstance(address, Address) for address in addresses)
         if addresses:
+            self.logger.debug("_add_new_addresses: %s", [a.to_string() for a in addresses])
             with self._new_addresses_lock:
                 self._new_addresses.extend(addresses)
             self._new_addresses_event.set()
-            if save:
-                self.save_addresses()
+            self.save_addresses()
             # Ensures addresses show in address list
             if self.network:
-                self.network.trigger_callback('updated')
+                self.network.trigger_callback('on_addresses_created', addresses, for_change)
 
     async def new_addresses(self) -> List[Address]:
         await self._new_addresses_event.wait()
@@ -1657,7 +1665,7 @@ class ImportedAddressWallet(ImportedWalletBase):
     def from_text(cls: Type[T], parent_wallet: 'ParentWallet', text: str) -> T:
         wallet = cls.create_within_parent(parent_wallet)
         for address in text.split():
-            wallet.import_address(Address.from_string(address))
+            wallet.import_address(address_from_string(address))
         # Avoid adding addresses twice in network.py
         wallet._new_addresses.clear()
         return wallet
@@ -1672,7 +1680,7 @@ class ImportedAddressWallet(ImportedWalletBase):
         assert type(data) is list or data is None, str(data)
         if data is None:
             data = []
-        self.addresses = [Address.from_string(addr) for addr in data]
+        self.addresses = [address_from_string(addr) for addr in data]
 
     def save_addresses(self) -> list:
         return [addr.to_string() for addr in self.addresses]
@@ -1759,9 +1767,9 @@ class ImportedPrivkeyWallet(ImportedWalletBase):
     def import_private_key(self, sec, pw):
         pubkey = self.get_keystore().import_privkey(sec, pw)
         self._parent_wallet.save_storage()
-        address_str = pubkey.to_address(coin=Net.COIN).to_string()
-        self._add_new_addresses([Address.from_string(address_str)])
-        return address_str
+        address = pubkey.to_address(coin=Net.COIN)
+        self._add_new_addresses([ address ])
+        return address
 
     def export_private_key(self, address, password):
         '''Returned in WIF format.'''
@@ -1778,7 +1786,7 @@ class ImportedPrivkeyWallet(ImportedWalletBase):
     def pubkeys_to_address(self, pubkey):
         pubkey = PublicKey.from_hex(pubkey)
         if pubkey in self.get_keystore().keypairs:
-            return Address.from_string(pubkey.to_address(coin=Net.COIN).to_string())
+            return address_from_string(pubkey.to_address(coin=Net.COIN).to_string())
 
 
 class Deterministic_Wallet(Abstract_Wallet):
@@ -1859,7 +1867,7 @@ class Deterministic_Wallet(Abstract_Wallet):
             first = len(chain)
             addresses = await run_in_thread(derive_addresses, range(first, first + count))
             chain.extend(addresses)
-        self._add_new_addresses(addresses)
+        self._add_new_addresses(addresses, for_change)
         return addresses
 
     def _is_fresh_address(self, address):
@@ -1898,12 +1906,11 @@ class Simple_Deterministic_Wallet(Simple_Wallet, Deterministic_Wallet):
         Deterministic_Wallet.__init__(self, parent_wallet, wallet_data)
         self.txin_type = 'p2pkh'
 
-    def get_public_key(self, address):
-        sequence = self.get_address_index(address)
-        pubkey = self.get_pubkey(*sequence)
-        return pubkey
+    def get_public_key(self, address: Address) -> str:
+        c, i = self.get_address_index(address)
+        return self.get_pubkey(c, i)
 
-    def get_pubkey(self, c, i):
+    def get_pubkey(self, c: bool, i: int) -> str:
         return self.derive_pubkeys(c, i)
 
     def get_public_keys(self, address):
@@ -1919,7 +1926,7 @@ class Simple_Deterministic_Wallet(Simple_Wallet, Deterministic_Wallet):
     def get_master_public_key(self):
         return self.get_keystore().get_master_public_key()
 
-    def derive_pubkeys(self, c, i):
+    def derive_pubkeys(self, c: bool, i: int) -> str:
         return self.get_keystore().derive_pubkey(c, i)
 
 
@@ -1948,7 +1955,7 @@ class Multisig_Wallet(Deterministic_Wallet):
 
     def pubkeys_to_address(self, pubkeys):
         redeem_script = self.pubkeys_to_redeem_script(pubkeys)
-        return P2SH_Address(hash160(redeem_script))
+        return P2SH_Address(hash160(redeem_script), Net.COIN)
 
     def pubkeys_to_redeem_script(self, pubkeys):
         assert all(isinstance(pubkey, str) for pubkey in pubkeys)
@@ -2006,7 +2013,7 @@ class ParentWallet:
     _type: Optional[str] = None
 
     def __init__(self, storage: WalletStorage,
-            creation_type: Optional[ParentWalletKinds]=None) -> None:
+            creation_type: Optional[str]=None) -> None:
         self._storage = storage
         self._logger = logs.get_logger(f"wallet[{self.name()}]")
 
@@ -2019,7 +2026,12 @@ class ParentWallet:
     def as_legacy_wallet_container(klass, storage: WalletStorage) -> 'ParentWallet':
         return klass(storage, ParentWalletKinds.LEGACY)
 
-    def load_state(self, creation_type: Optional[ParentWalletKinds]=None) -> None:
+    def move_to(self, new_path: str) -> None:
+        self._storage.move_to(new_path)
+        for child_wallet in self._child_wallets:
+            child_wallet._open_database(close_existing=True)
+
+    def load_state(self, creation_type: Optional[str]=None) -> None:
         self._type = self._storage.get("type", creation_type)
         assert creation_type is None or self._type == creation_type, \
             f"Parent wallet type conflict, got: {self._type}, expected: {creation_type}"
@@ -2037,7 +2049,7 @@ class ParentWallet:
             self._child_wallets[subwallet_id] = self._create_child_wallet(subwallet_data)
 
     def name(self) -> str:
-        return os.path.basename(self._storage.get_path())
+        return get_wallet_name_from_path(self.get_storage_path())
 
     def get_storage_path(self) -> str:
         return self._storage.get_path()
@@ -2052,8 +2064,7 @@ class ParentWallet:
         self._storage.write()
 
     def get_wallet_datastore(self, wallet_id: int) -> WalletData:
-        store = WalletData(self.get_storage_path(), self.tx_store_aeskey_bytes, wallet_id)
-        return store
+        return WalletData(self.get_storage_path(), self.tx_store_aeskey_bytes, wallet_id)
 
     def get_next_child_wallet_id(self) -> int:
         return len(self._child_wallets)

@@ -33,15 +33,13 @@ import time
 from typing import Union, Optional
 import webbrowser
 
-from bitcoinx import Address
-
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QBrush, QFont, QIcon, QColor
 from PyQt5.QtWidgets import (QDialog, QListWidget, QListWidgetItem, QMenu, QSplitter, QWidget,
     QVBoxLayout, QGridLayout, QLabel, QTextEdit)
 
 from electrumsv.app_state import app_state
-from electrumsv.bitcoin import COINBASE_MATURITY
+from electrumsv.bitcoin import COINBASE_MATURITY, address_from_string
 from electrumsv.i18n import _
 from electrumsv.platform import platform
 from electrumsv.util import timestamp_to_datetime, profiler, format_time
@@ -241,11 +239,10 @@ class HistoryList(MyTreeWidget):
 
 def get_tx_status(wallet: Abstract_Wallet, tx_hash: str, height: int, conf: int,
         timestamp: Union[bool, int]) -> TxStatus:
-    tx = wallet.get_transaction(tx_hash)
-    if not tx:
+    if not wallet.have_transaction_data(tx_hash):
         return TxStatus.MISSING
 
-    if tx.is_coinbase():
+    if wallet.is_coinbase_transaction(tx_hash):
         if height + COINBASE_MATURITY > wallet.get_local_height():
             return TxStatus.UNMATURED
     elif conf == 0:
@@ -350,7 +347,7 @@ class HistoryView(QSplitter):
         self._history_list.update()
 
     def update_tx_headers(self) -> None:
-        self._history_list.update_headers()
+        self._history_list.refresh_headers()
 
     def update_tx_labels(self) -> None:
         self._history_list.update_labels()
@@ -550,7 +547,8 @@ class HistoryView(QSplitter):
 
         title, msg = _('Import addresses'), _("Enter addresses")
         def import_addr(addr):
-            if wallet.import_address(Address.from_string(addr)):
-                return addr
-            return ''
+            address = address_from_string(addr)
+            if wallet.import_address(address):
+                return address
+            return None
         self._main_window._do_import(title, msg, import_addr)

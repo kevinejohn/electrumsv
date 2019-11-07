@@ -39,7 +39,7 @@ from .logs import logs
 from .network import Network
 from .simple_config import SimpleConfig
 from .storage import WalletStorage
-from .util import json_decode, DaemonThread, to_string, random_integer
+from .util import json_decode, DaemonThread, to_string, random_integer, get_wallet_name_from_path
 from .version import PACKAGE_VERSION
 from .wallet import ParentWallet
 
@@ -210,7 +210,7 @@ class Daemon(DaemonThread):
             self.cmd_runner.parent_wallet = wallet
             response = True
         elif sub == 'close_wallet':
-            path = config.get_wallet_path()
+            path = WalletStorage.canonical_path(config.get_wallet_path())
             if path in self.wallets:
                 self.stop_wallet_at_path(path)
                 response = True
@@ -244,12 +244,13 @@ class Daemon(DaemonThread):
 
     def load_wallet(self, path: str, password: Optional[str]) -> ParentWallet:
         # wizard will be launched if we return
-        if path in self.wallets:
-            wallet = self.wallets[path]
+        wallet_filepath = WalletStorage.canonical_path(path)
+        if wallet_filepath in self.wallets:
+            wallet = self.wallets[wallet_filepath]
             return wallet
-        storage = WalletStorage(path, manual_upgrades=True)
-        if not storage.file_exists():
+        if not WalletStorage.files_are_matched_by_path(wallet_filepath):
             return
+        storage = WalletStorage(wallet_filepath, manual_upgrades=True)
         if storage.is_encrypted():
             if not password:
                 return
@@ -264,16 +265,20 @@ class Daemon(DaemonThread):
         return parent_wallet
 
     def get_wallet(self, path: str) -> ParentWallet:
-        return self.wallets.get(path)
+        wallet_filepath = WalletStorage.canonical_path(path)
+        return self.wallets.get(wallet_filepath)
 
     def start_wallet(self, parent_wallet: ParentWallet) -> None:
+        # We expect the storage path to be exact, including the database extension. So it should
+        # match the canonical path used elsewhere.
         self.wallets[parent_wallet.get_storage_path()] = parent_wallet
         parent_wallet.start(self.network)
 
     def stop_wallet_at_path(self, path: str) -> None:
+        wallet_filepath = WalletStorage.canonical_path(path)
         # Issue #659 wallet may already be stopped.
-        if path in self.wallets:
-            parent_wallet = self.wallets.pop(path)
+        if wallet_filepath in self.wallets:
+            parent_wallet = self.wallets.pop(wallet_filepath)
             parent_wallet.stop()
 
     def stop_wallets(self):
@@ -287,11 +292,11 @@ class Daemon(DaemonThread):
         cmdname = config.get('cmd')
         cmd = known_commands[cmdname]
         if cmd.requires_wallet:
-            path = config.get_wallet_path()
+            path = WalletStorage.canonical_path(config.get_wallet_path())
             parent_wallet = self.wallets.get(path)
             if parent_wallet is None:
                 return {'error': 'Wallet "%s" is not loaded. Use "electrum-sv daemon load_wallet"'
-                        % os.path.basename(path)}
+                        % get_wallet_name_from_path(path)}
         else:
             parent_wallet = None
         # arguments passed to function

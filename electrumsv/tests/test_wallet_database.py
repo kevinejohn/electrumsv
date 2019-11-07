@@ -1,14 +1,16 @@
 import os
 import pytest
 import tempfile
-import unittest
+from typing import Tuple, Optional, List
 
 import bitcoinx
 
+from electrumsv.constants import TxFlags, TRANSACTION_FLAGS
 from electrumsv.transaction import Transaction
 from electrumsv.logs import logs
 from electrumsv import wallet_database
-from electrumsv.wallet_database import TxFlags, TxData, TxCache, TxProof, DBTxInput, DBTxOutput
+from electrumsv.wallet_database import (TxData, TxCache, TxCacheEntry, TxProof, DBTxInput,
+    DBTxOutput)
 
 logs.set_level("debug")
 
@@ -71,6 +73,9 @@ class StoreTimestampMixin:
 class _GenericKeyValueStore(StoreTimestampMixin, wallet_database.GenericKeyValueStore):
     pass
 
+class _GenericKeyValueStoreNonUnique(StoreTimestampMixin, wallet_database.GenericKeyValueStore):
+    def has_unique_keys(self) -> bool:
+        return False
 
 class _ObjectKeyValueStore(StoreTimestampMixin, wallet_database.ObjectKeyValueStore):
     pass
@@ -94,6 +99,55 @@ class TestJSONKeyValueStore:
 
     def test_get_nonexistent(self) -> None:
         assert self.db_values.get("nonexistent") is None
+
+    def test_upsert(self) -> None:
+        self.db_values.set("A", "B")
+        assert self.db_values.get("A") == "B"
+
+        self.db_values.set("A", "C")
+        assert self.db_values.get("A") == "C"
+
+        values = self.db_values.get_many_values([ "A" ])
+        assert len(values) == 1
+
+
+class TestGenericKeyValueStoreNonUnique:
+    @classmethod
+    def setup_class(cls):
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        db_filename = os.path.join(cls.temp_dir.name, "testgks")
+        cls.store = _GenericKeyValueStoreNonUnique(TEST_TABLE_NAME, db_filename, TEST_AESKEY, 0)
+
+    @classmethod
+    def teardown_class(cls):
+        cls.store.close()
+        cls.store = None
+        cls.temp_dir = None
+
+    def setup_method(self):
+        db = self.store._get_db()
+        db.execute(f"DELETE FROM {self.store._table_name}")
+        db.commit()
+
+        self.store._fetch_write_timestamp()
+
+    @pytest.mark.parametrize("variations,count", ((0, 0), (1, 3), (2, 3)))
+    def test__delete_duplicates(self, variations, count) -> None:
+        for i in range(variations):
+            k = os.urandom(10)
+            v = os.urandom(10)
+            for i in range(count):
+                self.store.add(k, v)
+        # 1 other.
+        self.store.add(os.urandom(10), os.urandom(10))
+
+        rows = self.store.get_all()
+        assert len(rows) == (variations * count) + 1
+
+        self.store._delete_duplicates()
+
+        rows = self.store.get_all()
+        assert len(rows) == variations + 1
 
 
 class TestGenericKeyValueStore:
@@ -253,24 +307,6 @@ class TestGenericKeyValueStore:
         assert row[1] != row[3] # DateCreated != DateDeleted
 
         assert self.store.get_write_timestamp() == 2
-
-    @pytest.mark.parametrize("variations,count", ((0, 0), (1, 3), (2, 3)))
-    def test__delete_duplicates(self, variations, count) -> None:
-        for i in range(variations):
-            k = os.urandom(10)
-            v = os.urandom(10)
-            for i in range(count):
-                self.store.add(k, v)
-        # 1 other.
-        self.store.add(os.urandom(10), os.urandom(10))
-
-        rows = self.store.get_all()
-        assert len(rows) == (variations * count) + 1
-
-        self.store._delete_duplicates()
-
-        rows = self.store.get_all()
-        assert len(rows) == variations + 1
 
 
 class TestObjectKeyValueStore:
@@ -856,6 +892,11 @@ class TestTransactionStore:
         assert merkle_branch1 == merkle_branch2
 
 
+class MockTransactionStore:
+    def update_proof(self, tx_id: str, proof: TxProof) -> None:
+        raise NotImplementedError
+
+
 class TestTxCache:
     @classmethod
     def setup_class(cls):
@@ -930,18 +971,18 @@ class TestTxCache:
 
         tx = Transaction.from_hex(tx_hex_1)
         data = [ tx.txid(), TxData(height=1295924,timestamp=1555296290,position=4,fee=None),
-            None, TxFlags.StateCleared ]
+            None, TxFlags.Unset ]
         cache.add([ data ])
         entry = cache.get_entry(tx.txid())
         assert entry is not None
-        assert TxFlags.StateCleared == entry.flags & TxFlags.StateCleared
+        assert TxFlags.Unset == entry.flags & TxFlags.STATE_MASK
 
-        cache.add_transaction(tx, TxFlags.StateSettled)
+        cache.add_transaction(tx, TxFlags.StateCleared)
 
         entry = cache.get_entry(tx.txid())
         assert entry is not None
         assert entry.bytedata is not None
-        assert TxFlags.StateSettled == entry.flags & TxFlags.StateSettled
+        assert TxFlags.StateCleared == entry.flags & TxFlags.StateCleared
 
     def test_add_then_update(self):
         cache = TxCache(self.store)
@@ -972,10 +1013,10 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(bytedata_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         metadata_1 = TxData()
-        cache.update_or_add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateCleared) ])
+        cache.update_or_add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateSettled) ])
         assert cache.is_cached(tx_id_1)
         entry = cache.get_entry(tx_id_1)
-        assert TxFlags.HasByteData | TxFlags.StateCleared == entry.flags
+        assert TxFlags.HasByteData | TxFlags.StateSettled == entry.flags
         assert entry.bytedata is not None
 
         # Update.
@@ -1006,10 +1047,10 @@ class TestTxCache:
         assert TxFlags.HasByteData | TxFlags.HasPosition | TxFlags.StateDispatched == entry.flags
         assert entry.bytedata is not None
 
-        cache.update_flags(tx_id_1, TxFlags.StateCleared, TxFlags.HasByteData|TxFlags.HasProofData)
+        cache.update_flags(tx_id_1, TxFlags.StateSettled, TxFlags.HasByteData|TxFlags.HasProofData)
         entry = cache.get_entry(tx_id_1)
         store_flags = self.store.get_flags(tx_id_1)
-        expected_flags = TxFlags.HasByteData | TxFlags.HasPosition | TxFlags.StateCleared
+        expected_flags = TxFlags.HasByteData | TxFlags.HasPosition | TxFlags.StateSettled
         assert expected_flags == store_flags, \
             f"{TxFlags.to_repr(expected_flags)} != {TxFlags.to_repr(store_flags)}"
         assert expected_flags == entry.flags, \
@@ -1030,6 +1071,24 @@ class TestTxCache:
         cache.delete(tx_id_1)
         assert not self.store.has(tx_id_1)
         assert not cache.is_cached(tx_id_1)
+
+    def test_uncleared_bytedata_requirements(self) -> None:
+        cache = TxCache(self.store)
+
+        tx_bytes_1 = bytes.fromhex(tx_hex_1)
+        tx_hash_bytes_1 = bitcoinx.double_sha256(tx_bytes_1)
+        tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
+        data = TxData(position=11)
+        for state_flag in TRANSACTION_FLAGS:
+            with pytest.raises(wallet_database.InvalidDataError):
+                cache.add([ (tx_id_1, data, None, state_flag) ])
+
+        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateSigned) ])
+
+        # We are applying a clearing of the bytedata, this should be invalid given uncleared.
+        for state_flag in TRANSACTION_FLAGS:
+            with pytest.raises(wallet_database.InvalidDataError):
+                cache.update([ (tx_id_1, data, None, state_flag | TxFlags.HasByteData) ])
 
     def test_get_flags(self):
         cache = TxCache(self.store)
@@ -1119,13 +1178,172 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(bytedata_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         data = TxData(position=11)
-        cache.add([ (tx_id_1, data, bytedata_1, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_1, data, bytedata_1, TxFlags.StateSettled) ])
 
         entry = cache.get_entry(tx_id_1, TxFlags.StateDispatched)
         assert entry is None
 
-        entry = cache.get_entry(tx_id_1, TxFlags.StateCleared)
+        entry = cache.get_entry(tx_id_1, TxFlags.StateSettled)
         assert entry is not None
+
+    # No complete cache of metadata, tx_id in cache, store not hit.
+    def test_get_entry_cached_already(self) -> None:
+        mock_store = MockTransactionStore()
+        cache = TxCache(mock_store, cache_metadata=False)
+        assert not cache._all_metadata_cached
+
+        # Verify that we do not hit the store for our cached entry.
+        our_entry = TxCacheEntry(TxData(position=11), TxFlags.HasPosition)
+        cache.set_cache_entries({ "tx_id": our_entry })
+        their_entry = cache.get_entry("tx_id")
+        assert our_entry is their_entry
+
+    # No complete cache of metadata, tx_id not in cache, store hit.
+    def test_get_entry_cached_on_demand(self) -> None:
+        metadata = TxData(position=11)
+        flags = TxFlags.HasPosition
+        def _get(*args) -> Tuple[TxData, Optional[bytes], TxFlags]:
+            nonlocal metadata, flags
+            return metadata, None, flags
+
+        mock_store = MockTransactionStore()
+        mock_store.get = _get
+
+        cache = TxCache(mock_store, cache_metadata=False)
+        assert not cache._all_metadata_cached
+        their_entry = cache.get_entry("tx_id")
+        assert their_entry.metadata == metadata
+        assert their_entry.flags == flags
+
+    # No complete cache of metadata, tx_id in cache, no bytedata cached, store hit for bytedata.
+    def test_get_entry_cached_already_have_uncached_bytedata(self) -> None:
+        metadata = TxData(position=11)
+        flags = TxFlags.HasPosition | TxFlags.HasByteData
+        bytedata = b'123456'
+        def _get(*args) -> Tuple[TxData, Optional[bytes], TxFlags]:
+            nonlocal metadata, bytedata, flags
+            return metadata, bytedata, flags
+        def _validate_transaction_bytes(*args) -> bool:
+            return True
+
+        mock_store = MockTransactionStore()
+        mock_store.get = _get
+        cache = TxCache(mock_store, cache_metadata=False)
+        cache._validate_transaction_bytes = _validate_transaction_bytes
+        assert not cache._all_metadata_cached
+
+        our_entry = TxCacheEntry(metadata, flags, is_bytedata_cached=False)
+        cache.set_cache_entries({ "tx_id": our_entry })
+
+        # We explicitly filter for non-bytedata fields. This will not trigger the fetching of
+        # bytedata from the store into the cache.
+        their_entry = cache.get_entry("tx_id", TxFlags.HasPosition, TxFlags.HasPosition)
+        assert our_entry is their_entry
+
+        # This explicitly requests the bytedata and will fetch it from the store.
+        their_entry = cache.get_entry("tx_id", TxFlags.HasByteData, TxFlags.HasByteData)
+        assert their_entry.metadata == metadata
+        assert their_entry.bytedata == bytedata
+        assert their_entry.flags == flags
+
+        del cache._cache["tx_id"]
+
+        # This explicitly requests unfiltered entries and will fetch bytedata from the store.
+        their_entry = cache.get_entry("tx_id")
+        assert their_entry.metadata == metadata
+        assert their_entry.bytedata == bytedata
+        assert their_entry.flags == flags
+
+    # No complete cache of metadata, tx_id in cache, no bytedata cached, store hit for bytedata.
+    def test_get_entries_cached_already_have_uncached_bytedata(self) -> None:
+        metadata = TxData(position=11)
+        flags = TxFlags.HasPosition | TxFlags.HasByteData
+        bytedata = b'123456'
+        def _get_many(*args) -> List[Tuple[str, Tuple[TxData, Optional[bytes], TxFlags]]]:
+            nonlocal metadata, bytedata, flags
+            return [ ("tx_id", metadata, bytedata, flags) ]
+        def _validate_transaction_bytes(*args) -> bool:
+            return True
+
+        mock_store = MockTransactionStore()
+        mock_store.get_many = _get_many
+        cache = TxCache(mock_store, cache_metadata=False)
+        cache._validate_transaction_bytes = _validate_transaction_bytes
+        assert not cache._all_metadata_cached
+
+        our_entry = TxCacheEntry(metadata, flags, is_bytedata_cached=False)
+        cache.set_cache_entries({ "tx_id": our_entry })
+
+        # We explicitly filter for non-bytedata fields. This will not trigger the fetching of
+        # bytedata from the store into the cache.
+        their_entries = cache.get_entries(TxFlags.HasPosition, TxFlags.HasPosition, [ "tx_id" ])
+        assert our_entry is their_entries[0][1]
+
+        # This explicitly requests the bytedata and will fetch it from the store.
+        their_entries = cache.get_entries(TxFlags.HasByteData, TxFlags.HasByteData, [ "tx_id" ])
+        their_entry = their_entries[0][1]
+        assert their_entry.metadata == metadata
+        assert their_entry.bytedata == bytedata
+        assert their_entry.flags == flags
+
+        del cache._cache["tx_id"]
+
+        # This explicitly requests unfiltered entries and will fetch bytedata from the store.
+        their_entries = cache.get_entries(tx_ids=[ "tx_id" ])
+        their_entry = their_entries[0][1]
+        assert their_entry.metadata == metadata
+        assert their_entry.bytedata == bytedata
+        assert their_entry.flags == flags
+
+    # No complete cache of metadata, tx_id in cache, no bytedata cached, store hit for bytedata.
+    def test_get_entries_all_metadata_cached_already_have_uncached_bytedata(self) -> None:
+        metadata = TxData(position=11)
+        flags = TxFlags.HasPosition | TxFlags.HasByteData
+        bytedata = b'123456'
+        def _get_metadata_many(*args) -> List[Tuple[str, TxData, int]]:
+            nonlocal metadata, bytedata, flags
+            return [ ("tx_id", metadata, flags) ]
+        def _get_many(_flags: TxFlags, _mask: TxFlags,
+                _tx_ids: List[str]) -> List[Tuple[str, TxData, Optional[bytes], TxFlags]]:
+            nonlocal metadata, bytedata, flags
+            assert "tx_id" in _tx_ids
+            return [ ("tx_id", metadata, bytedata, flags) ]
+        def _validate_transaction_bytes(*args) -> bool:
+            return True
+
+        mock_store = MockTransactionStore()
+        mock_store.get_metadata_many = _get_metadata_many
+        mock_store.get_many = _get_many
+        cache = TxCache(mock_store, cache_metadata=True)
+        assert cache._all_metadata_cached
+        assert "tx_id" in cache._cache
+        cache._validate_transaction_bytes = _validate_transaction_bytes
+
+        # We explicitly filter for non-bytedata fields. This will not trigger the fetching of
+        # bytedata from the store into the cache.
+        their_entries = cache.get_entries(TxFlags.HasPosition, TxFlags.HasPosition, [ "tx_id" ])
+        their_entry = their_entries[0][1]
+        assert their_entry.metadata == metadata
+        assert their_entry.bytedata is None
+        assert their_entry.flags == flags
+        bytedataless_entry = their_entry
+
+        # This explicitly requests the bytedata and will fetch it from the store.
+        their_entries = cache.get_entries(TxFlags.HasByteData, TxFlags.HasByteData, [ "tx_id" ])
+        their_entry = their_entries[0][1]
+        assert their_entry.metadata == metadata
+        assert their_entry.bytedata == bytedata
+        assert their_entry.flags == flags
+
+        # Reset the cache entry back to the bytedata-less entry.
+        cache._cache["tx_id"] = bytedataless_entry
+
+        # This explicitly requests unfiltered entries and will fetch bytedata from the store.
+        their_entries = cache.get_entries(tx_ids=[ "tx_id" ])
+        their_entry = their_entries[0][1]
+        assert their_entry.metadata == metadata
+        assert their_entry.bytedata == bytedata
+        assert their_entry.flags == flags
 
     def test_get_height(self):
         cache = TxCache(self.store)
@@ -1134,14 +1352,14 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(bytedata_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         metadata_1 = TxData(height=11)
-        cache.add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateSettled) ])
 
         assert 11 == cache.get_height(tx_id_1)
 
-        cache.update_flags(tx_id_1, TxFlags.StateSettled)
+        cache.update_flags(tx_id_1, TxFlags.StateCleared, TxFlags.HasByteData)
         assert 11 == cache.get_height(tx_id_1)
 
-        cache.update_flags(tx_id_1, TxFlags.StateReceived)
+        cache.update_flags(tx_id_1, TxFlags.StateReceived, TxFlags.HasByteData)
         assert cache.get_height(tx_id_1) is None
 
     def test_get_unsynced_ids(self):
@@ -1151,7 +1369,7 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(bytedata_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         metadata_1 = TxData(height=11)
-        cache.add([ (tx_id_1, metadata_1, None, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_1, metadata_1, None, TxFlags.Unset) ])
 
         results = cache.get_unsynced_ids()
         assert 1 == len(results)
@@ -1169,7 +1387,7 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(tx_bytes_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         data = TxData(height=11, position=22)
-        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateSettled) ])
 
         results = cache.get_unverified_entries(100)
         assert 0 == len(results)
@@ -1182,7 +1400,7 @@ class TestTxCache:
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
 
         data = TxData(height=11)
-        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateSettled) ])
 
         results = cache.get_unverified_entries(10)
         assert 0 == len(results)
@@ -1200,7 +1418,7 @@ class TestTxCache:
         tx_id_y1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_y1)
 
         data_y1 = TxData(height=common_height+1, timestamp=22, position=33, fee=44)
-        cache.add([ (tx_id_y1, data_y1, tx_bytes_y1, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_y1, data_y1, tx_bytes_y1, TxFlags.StateSettled) ])
 
         # Add the transaction that would be reset but is below the common height.
         tx_bytes_n1 = bytes.fromhex(tx_hex_1) + b"n1"
@@ -1208,7 +1426,7 @@ class TestTxCache:
         tx_id_n1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_n1)
 
         data_n1 = TxData(height=common_height-1, timestamp=22, position=33, fee=44)
-        cache.add([ (tx_id_n1, data_n1, tx_bytes_n1, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_n1, data_n1, tx_bytes_n1, TxFlags.StateSettled) ])
 
         # Add the transaction that would be reset but is the common height.
         tx_bytes_n2 = bytes.fromhex(tx_hex_1) + b"n2"
@@ -1216,7 +1434,7 @@ class TestTxCache:
         tx_id_n2 = bitcoinx.hash_to_hex_str(tx_hash_bytes_n2)
 
         data_n2 = TxData(height=common_height, timestamp=22, position=33, fee=44)
-        cache.add([ (tx_id_n2, data_n2, tx_bytes_n2, TxFlags.StateCleared) ])
+        cache.add([ (tx_id_n2, data_n2, tx_bytes_n2, TxFlags.StateSettled) ])
 
         # Add a canary transaction that should remain untouched due to non-cleared state.
         tx_bytes_n3 = bytes.fromhex(tx_hex_2)
@@ -1238,7 +1456,7 @@ class TestTxCache:
         assert 0 == y1.metadata.timestamp
         assert 0 == y1.metadata.position
         assert data_y1.fee == y1.metadata.fee
-        assert TxFlags.StateSettled | TxFlags.HasByteData | TxFlags.HasFee == y1.flags, \
+        assert TxFlags.StateCleared | TxFlags.HasByteData | TxFlags.HasFee == y1.flags, \
             TxFlags.to_repr(y1.flags)
 
         expected_flags = (TxFlags.HasByteData | TxFlags.HasTimestamp | TxFlags.HasFee |
@@ -1250,7 +1468,7 @@ class TestTxCache:
         assert data_n1.timestamp == n1.metadata.timestamp
         assert data_n1.position == n1.metadata.position
         assert data_n1.fee == n1.metadata.fee
-        assert TxFlags.StateCleared | expected_flags == n1.flags, TxFlags.to_repr(n1.flags)
+        assert TxFlags.StateSettled | expected_flags == n1.flags, TxFlags.to_repr(n1.flags)
 
         # Skipped, canary common height.
         n2 = [ m[1] for m in metadatas if m[0] == tx_id_n2 ][0]
@@ -1258,7 +1476,7 @@ class TestTxCache:
         assert data_n2.timestamp == n2.metadata.timestamp
         assert data_n2.position == n2.metadata.position
         assert data_n2.fee == n2.metadata.fee
-        assert TxFlags.StateCleared | expected_flags == n2.flags, TxFlags.to_repr(n2.flags)
+        assert TxFlags.StateSettled | expected_flags == n2.flags, TxFlags.to_repr(n2.flags)
 
         # Skipped, canary non-cleared.
         n3 = [ m[1] for m in metadatas if m[0] == tx_id_n3 ][0]

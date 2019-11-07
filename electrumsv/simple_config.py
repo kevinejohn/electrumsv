@@ -5,6 +5,7 @@ import threading
 
 from . import util
 from .bitcoin import MAX_FEE_RATE
+from .constants import DATABASE_EXT
 from .logs import logs
 from .platform import platform
 from .util import make_dir, JSON
@@ -199,8 +200,11 @@ class SimpleConfig:
 
         # path in config file
         path = self.get('default_wallet_path')
-        if path and os.path.exists(path):
-            return path
+        if path:
+            if os.path.exists(path):
+                return path
+            if not path.endswith(DATABASE_EXT) and os.path.exists(path + DATABASE_EXT):
+                return path
 
         # default path
         util.assert_datadir_available(self.path)
@@ -231,7 +235,7 @@ class SimpleConfig:
 
     def save_last_wallet(self, wallet):
         if self.get('wallet_path') is None:
-            path = wallet.storage.get_path()
+            path = wallet.get_storage_path()
             self.set_key('gui_last_wallet', path)
 
     def max_fee_rate(self):
