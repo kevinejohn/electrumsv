@@ -129,8 +129,6 @@ class TestGenericKeyValueStoreNonUnique:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
-        self.store._fetch_write_timestamp()
-
     @pytest.mark.parametrize("variations,count", ((0, 0), (1, 3), (2, 3)))
     def test__delete_duplicates(self, variations, count) -> None:
         for i in range(variations):
@@ -168,18 +166,12 @@ class TestGenericKeyValueStore:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
-        self.store._fetch_write_timestamp()
-
     def test_add(self):
         k = os.urandom(10)
         v = os.urandom(10)
 
-        assert self.store.get_write_timestamp() == 0
-
         self.store.timestamp = 1
         self.store.add(k, v)
-
-        assert self.store.get_write_timestamp() == 1
 
         row = self.store.get_row(k)
         assert row is not None
@@ -192,12 +184,8 @@ class TestGenericKeyValueStore:
     def test_add_many(self):
         kvs = [ (os.urandom(10), os.urandom(10)) for i in range(10) ]
 
-        assert self.store.get_write_timestamp() == 0
-
         self.store.timestamp = 1
         self.store.add_many(kvs)
-
-        assert self.store.get_write_timestamp() == 1
 
         kvs2 = self.store.get_many_values([ k for (k, v) in kvs ])
         assert len(kvs) == len(kvs2)
@@ -229,13 +217,9 @@ class TestGenericKeyValueStore:
         self.store.timestamp = 1
         self.store.add(k, v1)
 
-        assert self.store.get_write_timestamp() == 1
-
         v2 = os.urandom(10)
         self.store.timestamp = 2
         self.store.update(k, v2)
-
-        assert self.store.get_write_timestamp() == 2
 
         row = self.store.get_row(k)
         assert row is not None
@@ -261,8 +245,6 @@ class TestGenericKeyValueStore:
         self.store.timestamp = 1
         self.store.add(k, v)
 
-        assert self.store.get_write_timestamp() == 1
-
         self.store.timestamp = 2
         self.store.delete(k)
 
@@ -276,16 +258,12 @@ class TestGenericKeyValueStore:
         assert row[3] is not None # DateDeleted
         assert row[1] != row[3] # DateCreated != DateDeleted
 
-        assert self.store.get_write_timestamp() == 2
-
     def test_delete_value(self):
         k = os.urandom(10)
         v = os.urandom(10)
 
         self.store.timestamp = 1
         self.store.add(k, v)
-
-        assert self.store.get_write_timestamp() ==  1
 
         self.store.timestamp = 2
 
@@ -306,8 +284,6 @@ class TestGenericKeyValueStore:
         assert row[3] is not None # DateDeleted
         assert row[1] != row[3] # DateCreated != DateDeleted
 
-        assert self.store.get_write_timestamp() == 2
-
 
 class TestObjectKeyValueStore:
     @classmethod
@@ -327,8 +303,6 @@ class TestObjectKeyValueStore:
         db = self.store._get_db()
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
-
-        self.store._fetch_write_timestamp()
 
     def test__encrypt_key(self) -> None:
         v = self.store._encrypt_key("my_key")
@@ -455,8 +429,6 @@ class TestTransactionInputStore:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
-        self.store._fetch_write_timestamp()
-
     def test_pack_unpack(self):
         packed_raw = self.store._pack_value(self.txin1)
         address_string2, prevout_tx_hash2, prev_idx2, amount2 = self.store._unpack_value(
@@ -509,8 +481,6 @@ class TestTransactionOutputStore:
         db = self.store._get_db()
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
-
-        self.store._fetch_write_timestamp()
 
     def test_pack_unpack(self):
         packed_raw = self.store._pack_value(self.txout1)
@@ -1511,8 +1481,6 @@ class TestXputCache:
             db = store._get_db()
             db.execute(f"DELETE FROM {store._table_name}")
             db.commit()
-
-            store._fetch_write_timestamp()
 
     def test_cache_with_preload(self):
         tx_id = os.urandom(10).hex()

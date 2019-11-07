@@ -1148,7 +1148,7 @@ class Abstract_Wallet:
         if all_index is None:
             # Let the coin chooser select the coins to spend
             max_change = self.max_change_outputs if self.multiple_change else 1
-            coin_chooser = coinchooser.CoinChooserRandom()
+            coin_chooser = coinchooser.CoinChooserPrivacy()
             tx = coin_chooser.make_tx(inputs, outputs, change_addrs[:max_change],
                                       fee_estimator, self.dust_threshold())
         else:
@@ -1535,7 +1535,7 @@ class Abstract_Wallet:
     def _add_new_addresses(self, addresses: Iterable[Address], for_change: bool=False):
         assert all(isinstance(address, Address) for address in addresses)
         if addresses:
-            self.logger.debug("_add_new_addresses: %s", [a.to_string() for a in addresses])
+            # self.logger.debug("_add_new_addresses: %s", [a.to_string() for a in addresses])
             with self._new_addresses_lock:
                 self._new_addresses.extend(addresses)
             self._new_addresses_event.set()

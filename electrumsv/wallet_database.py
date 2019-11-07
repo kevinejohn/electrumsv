@@ -124,7 +124,8 @@ def byte_repr(value):
 class BaseWalletStore:
     _table_name = None
 
-    def __init__(self, table_name: str, wallet_path: str, aeskey: Optional[bytes], group_id: int,
+    def __init__(self, table_name: str, wallet_path: str, aeskey: Optional[bytes],
+            group_id: Optional[int]=None,
             migration_context: Optional[MigrationContext]=None) -> None:
         self.set_aeskey(aeskey)
 
@@ -141,8 +142,6 @@ class BaseWalletStore:
         else:
             self._db_create(db)
         db.commit()
-
-        self._fetch_write_timestamp()
 
     def close(self):
         if self._aes_key is None:
@@ -191,35 +190,9 @@ class BaseWalletStore:
             column_types[column_name] = column_type
         return column_types
 
-    def get_write_timestamp(self):
-        "Get the cached write timestamp (when anything was last updated or deleted)."
-        return self._write_timestamp
-
     def _get_current_timestamp(self):
         "Get the current timestamp in a form suitable for database column storage."
         return int(time.time())
-
-    def _fetch_write_timestamp(self):
-        "Calculate the timestamp of the last write to this table, based on database metadata."
-        self._write_timestamp = 0
-
-        if self._table_name is None:
-            return
-
-        db = self._get_db()
-        cursor = db.execute(f"SELECT DateUpdated FROM {self._table_name} "+
-            "WHERE GroupId=? "+
-            "ORDER BY DateUpdated DESC LIMIT 1", [self._group_id])
-        row = cursor.fetchone()
-        if row is not None:
-            self._write_timestamp = max(row[0], self._write_timestamp)
-
-        cursor = db.execute(f"SELECT DateDeleted FROM {self._table_name} "+
-            "WHERE GroupId=? "+
-            "ORDER BY DateDeleted DESC LIMIT 1", [self._group_id])
-        row = cursor.fetchone()
-        if row is not None and row[0] is not None:
-            self._write_timestamp = max(row[0], self._write_timestamp)
 
     def _encrypt_nop(self, value: bytes) -> bytes:
         return value
@@ -333,25 +306,6 @@ class GenericKeyValueStore(BaseWalletStore):
         else:
             raise Exception("Asked to migrate unexpected versions", context)
 
-    def _fetch_write_timestamp(self):
-        "Calculate the timestamp of the last write to this table, based on database metadata."
-        self._write_timestamp = 0
-
-        db = self._get_db()
-        cursor = db.execute(f"SELECT DateUpdated FROM {self._table_name} "+
-            "WHERE GroupId=? "+
-            "ORDER BY DateUpdated DESC LIMIT 1", [self._group_id])
-        row = cursor.fetchone()
-        if row is not None:
-            self._write_timestamp = max(row[0], self._write_timestamp)
-
-        cursor = db.execute(f"SELECT DateDeleted FROM {self._table_name} "+
-            "WHERE GroupID=? "+
-            "ORDER BY DateDeleted DESC LIMIT 1", [self._group_id])
-        row = cursor.fetchone()
-        if row is not None and row[0] is not None:
-            self._write_timestamp = max(row[0], self._write_timestamp)
-
     @tprofiler
     def add(self, key: str, value: bytes) -> None:
         return self._add(key, value)
@@ -361,7 +315,6 @@ class GenericKeyValueStore(BaseWalletStore):
         ekey = self._encrypt_key(key)
         evalue = self._encrypt(value)
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
         db = self._get_db()
         db.execute(self._CREATE_SQL, [self._group_id, ekey, evalue, timestamp, timestamp])
         db.commit()
@@ -375,7 +328,6 @@ class GenericKeyValueStore(BaseWalletStore):
             assert type(value) is bytes, f"bad value {value}"
             datas.append([ self._group_id, self._encrypt_key(key), self._encrypt(value),
                 timestamp, timestamp])
-        self._write_timestamp = timestamp
         db = self._get_db()
         db.executemany(self._CREATE_SQL, datas)
         db.commit()
@@ -453,7 +405,6 @@ class GenericKeyValueStore(BaseWalletStore):
             ekey = self._encrypt_key(key)
             evalue = self._encrypt(value)
             timestamp = self._get_current_timestamp()
-            self._write_timestamp = timestamp
             db = self._get_db()
             db.execute(self._UPSERT_SQL, [self._group_id, ekey, evalue, timestamp, timestamp])
             db.commit()
@@ -472,7 +423,6 @@ class GenericKeyValueStore(BaseWalletStore):
         ekey = self._encrypt_key(key)
         evalue = self._encrypt(value)
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
         db = self._get_db()
         cursor = db.execute(self._UPDATE_SQL, [evalue, timestamp, self._group_id, ekey])
         update_count = cursor.rowcount
@@ -488,7 +438,6 @@ class GenericKeyValueStore(BaseWalletStore):
             assert type(value) is bytes
             datas.append(
                 [ self._encrypt(value), timestamp, self._group_id, self._encrypt_key(key) ])
-        self._write_timestamp = timestamp
         db = self._get_db()
         db.executemany(self._UPDATE_SQL, datas)
         db.commit()
@@ -498,7 +447,6 @@ class GenericKeyValueStore(BaseWalletStore):
     def delete(self, key: str) -> None:
         ekey = self._encrypt_key(key)
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
         db = self._get_db()
         db.execute(self._DELETE_SQL, [timestamp, self._group_id, ekey])
         db.commit()
@@ -509,7 +457,6 @@ class GenericKeyValueStore(BaseWalletStore):
         ekey = self._encrypt_key(key)
         evalue = self._encrypt(value)
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
         db = self._get_db()
         db.execute(self._DELETE_VALUE_SQL, [timestamp, self._group_id, ekey, evalue])
         db.commit()
@@ -523,7 +470,6 @@ class GenericKeyValueStore(BaseWalletStore):
             ekey = self._encrypt_key(key)
             evalue = self._encrypt(value)
             datas.append((timestamp, self._group_id, ekey, evalue))
-        self._write_timestamp = timestamp
         db = self._get_db()
         db.executemany(self._DELETE_VALUE_SQL, datas)
         db.commit()
@@ -1039,7 +985,6 @@ class TransactionStore(BaseWalletStore):
     def add_many(self, entries: List[Tuple[str, TxData, Optional[bytes], int]]) -> None:
         db = self._get_db()
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
         # TODO: Make this a batch update.
         for tx_id, metadata, bytedata, flags in entries:
             etx_id = self._encrypt_hex(tx_id)
@@ -1067,7 +1012,6 @@ class TransactionStore(BaseWalletStore):
     @tprofiler
     def update_many(self, entries: List[Tuple[str, TxData, bytes, int]]) -> None:
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
 
         datas = []
         for tx_id, metadata, bytedata, flags in entries:
@@ -1101,7 +1045,6 @@ class TransactionStore(BaseWalletStore):
         # NOTE: This should only be used if it knows the existing flags column value, it should
         # preserve the state, bytedata and proofdata flags if it does not intend to clear them.
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
 
         datas = []
         for tx_id, data, flags in entries:
@@ -1122,7 +1065,6 @@ class TransactionStore(BaseWalletStore):
     def update_flags(self, tx_id: str, flags: int,
             mask: Optional[int]=TxFlags.Unset) -> None:
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
 
         etx_id = self._encrypt_hex(tx_id)
         db = self._get_db()
@@ -1135,7 +1077,6 @@ class TransactionStore(BaseWalletStore):
     @tprofiler
     def update_proof(self, tx_id: str, proof: TxProof) -> None:
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
 
         etx_id = self._encrypt_hex(tx_id)
         raw = self._pack_proof(proof)
@@ -1151,7 +1092,6 @@ class TransactionStore(BaseWalletStore):
     @tprofiler
     def delete(self, tx_id: str) -> None:
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
 
         etx_id = self._encrypt_hex(tx_id)
         db = self._get_db()
@@ -1165,7 +1105,6 @@ class TransactionStore(BaseWalletStore):
     def delete_many(self, tx_ids: Iterable[str]) -> None:
         # TODO: Integrate this with delete and look at using executemany.
         timestamp = self._get_current_timestamp()
-        self._write_timestamp = timestamp
 
         db = self._get_db()
         for tx_id in tx_ids:
