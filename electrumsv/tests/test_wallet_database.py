@@ -36,13 +36,14 @@ class TestBaseWalletStore:
         db_filename = os.path.join(self.temp_dir.name, "testbws")
         aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
         aeskey = bytes.fromhex(aeskey_hex)
-        self.store = wallet_database.BaseWalletStore(None, db_filename, aeskey, 0)
+        self.db_context = wallet_database.DatabaseContext(db_filename)
+        self.store = wallet_database.BaseWalletStore(None, self.db_context, aeskey, 0)
 
         self.tx_id = os.urandom(32).hex()
 
     def teardown_method(self, method):
         self.store.close()
-        self.store = None
+        self.db_context.close()
 
     def test_encrypt(self):
         data_hex = ("31d4e7921ec6692dd5b155799af530ad58cc9c86663d76356e9cce817f834f73b90e53e"+
@@ -88,14 +89,16 @@ class TestJSONKeyValueStore:
     @classmethod
     def setup_class(cls) -> None:
         cls.temp_dir = tempfile.TemporaryDirectory()
-        db_path = os.path.join(cls.temp_dir.name, "test")
+        db_filename = os.path.join(cls.temp_dir.name, "test")
 
-        cls.db_values = wallet_database.JSONKeyValueStore(TEST_TABLE_NAME, db_path, TEST_AESKEY, 0)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.db_values = wallet_database.JSONKeyValueStore(TEST_TABLE_NAME, cls.db_context,
+            TEST_AESKEY, 0)
 
     @classmethod
     def teardown_class(cls) -> None:
         cls.db_values.close()
-        del cls.db_values
+        cls.db_context.close()
 
     def test_get_nonexistent(self) -> None:
         assert self.db_values.get("nonexistent") is None
@@ -116,16 +119,17 @@ class TestGenericKeyValueStoreNonUnique:
     def setup_class(cls):
         cls.temp_dir = tempfile.TemporaryDirectory()
         db_filename = os.path.join(cls.temp_dir.name, "testgks")
-        cls.store = _GenericKeyValueStoreNonUnique(TEST_TABLE_NAME, db_filename, TEST_AESKEY, 0)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.store = _GenericKeyValueStoreNonUnique(TEST_TABLE_NAME, cls.db_context, TEST_AESKEY, 0)
 
     @classmethod
     def teardown_class(cls):
         cls.store.close()
-        cls.store = None
+        cls.db_context.close()
         cls.temp_dir = None
 
     def setup_method(self):
-        db = self.store._get_db()
+        db = self.store._db
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
@@ -153,16 +157,17 @@ class TestGenericKeyValueStore:
     def setup_class(cls):
         cls.temp_dir = tempfile.TemporaryDirectory()
         db_filename = os.path.join(cls.temp_dir.name, "testgks")
-        cls.store = _GenericKeyValueStore(TEST_TABLE_NAME, db_filename, TEST_AESKEY, 0)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.store = _GenericKeyValueStore(TEST_TABLE_NAME, cls.db_context, TEST_AESKEY, 0)
 
     @classmethod
     def teardown_class(cls):
         cls.store.close()
-        cls.store = None
+        cls.db_context.close()
         cls.temp_dir = None
 
     def setup_method(self):
-        db = self.store._get_db()
+        db = self.store._db
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
@@ -290,17 +295,18 @@ class TestObjectKeyValueStore:
     def setup_class(cls):
         cls.temp_dir = tempfile.TemporaryDirectory()
         db_filename = os.path.join(cls.temp_dir.name, "testokvs")
-        cls.store = _ObjectKeyValueStore(TEST_TABLE_NAME, db_filename, TEST_AESKEY,
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.store = _ObjectKeyValueStore(TEST_TABLE_NAME, cls.db_context, TEST_AESKEY,
             0)
 
     @classmethod
     def teardown_class(cls):
         cls.store.close()
-        cls.store = None
+        cls.db_context.close()
         cls.temp_dir = None
 
     def setup_method(self):
-        db = self.store._get_db()
+        db = self.store._db
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
@@ -410,7 +416,8 @@ class TestTransactionInputStore:
         table_name = "test_table"
         aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
         aeskey = bytes.fromhex(aeskey_hex)
-        cls.store = wallet_database.TransactionInputStore(db_filename, aeskey, 0)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.store = wallet_database.TransactionInputStore(cls.db_context, aeskey, 0)
 
         address_string = "address_string1"
         prevout_tx_hash = "prevout_tx_hash1"
@@ -421,11 +428,11 @@ class TestTransactionInputStore:
     @classmethod
     def teardown_class(cls):
         cls.store.close()
-        cls.store = None
+        cls.db_context.close()
         cls.temp_dir = None
 
     def setup_method(self):
-        db = self.store._get_db()
+        db = self.store._db
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
@@ -463,7 +470,8 @@ class TestTransactionOutputStore:
         table_name = "test_table"
         aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
         aeskey = bytes.fromhex(aeskey_hex)
-        cls.store = wallet_database.TransactionOutputStore(db_filename, aeskey, 0)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.store = wallet_database.TransactionOutputStore(cls.db_context, aeskey, 0)
 
         address_string1 = "12345"
         out_tx_n1 = 20
@@ -474,11 +482,11 @@ class TestTransactionOutputStore:
     @classmethod
     def teardown_class(cls):
         cls.store.close()
-        cls.store = None
+        cls.db_context.close()
         cls.temp_dir = None
 
     def setup_method(self):
-        db = self.store._get_db()
+        db = self.store._db
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
@@ -512,25 +520,26 @@ class TestTransactionStore:
         db_filename = os.path.join(cls.temp_dir.name, "testts")
         aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
         aeskey = bytes.fromhex(aeskey_hex)
-        cls.store = wallet_database.TransactionStore(db_filename, aeskey, 0)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.store = wallet_database.TransactionStore(cls.db_context, aeskey, 0)
 
         cls.tx_id = os.urandom(32).hex()
 
     @classmethod
     def teardown_class(cls):
         cls.store.close()
-        cls.store = None
+        cls.db_context.close()
         cls.temp_dir = None
 
     def setup_method(self):
-        db = self.store._get_db()
+        db = self.store._db
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
     def test_create_db_passive(self):
         # This has already run on TransactionStore creation. We test that it does not error being
         # run again, if the database entities already exist.
-        self.store._db_create(self.store._get_db())
+        self.store._db_create(self.store._db)
 
     def test_has_for_missing_transaction(self):
         assert not self.store.has(self.tx_id)
@@ -874,16 +883,19 @@ class TestTxCache:
         db_filename = os.path.join(cls.temp_dir.name, "testtxc")
         aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
         aeskey = bytes.fromhex(aeskey_hex)
-        cls.store = wallet_database.TransactionStore(db_filename, aeskey, 0)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.store = wallet_database.TransactionStore(cls.db_context, aeskey, 0)
 
     @classmethod
     def teardown_class(cls):
         cls.store.close()
         cls.store = None
+        cls.db_context.close()
+        cls.db_context = None
         cls.temp_dir = None
 
     def setup_method(self):
-        db = self.store._get_db()
+        db = self.store._db
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
@@ -1465,20 +1477,22 @@ class TestXputCache:
         db_filename_txout = os.path.join(cls.temp_dir.name, "test_txout")
         aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
         aeskey = bytes.fromhex(aeskey_hex)
-        cls.txin_store = wallet_database.TransactionInputStore(db_filename_txin, aeskey, 0)
-        cls.txout_store = wallet_database.TransactionOutputStore(db_filename_txout, aeskey, 0)
+        cls.db_context_txin = wallet_database.DatabaseContext(db_filename_txin)
+        cls.db_context_txout = wallet_database.DatabaseContext(db_filename_txout)
+        cls.txin_store = wallet_database.TransactionInputStore(cls.db_context_txin, aeskey, 0)
+        cls.txout_store = wallet_database.TransactionOutputStore(cls.db_context_txout, aeskey, 0)
 
     @classmethod
     def teardown_class(cls):
         cls.txin_store.close()
-        cls.txin_store = None
         cls.txout_store.close()
-        cls.txout_store = None
+        cls.db_context_txin.close()
+        cls.db_context_txout.close()
         cls.temp_dir = None
 
     def setup_method(self):
         for store in (self.txin_store, self.txout_store):
-            db = store._get_db()
+            db = store._db
             db.execute(f"DELETE FROM {store._table_name}")
             db.commit()
 
@@ -1568,3 +1582,24 @@ class TestXputCache:
             # Check the store no longer has the entry.
             entries = tx_store.get_entries(tx_id)
             assert 0 == len(entries)
+
+
+class TestDatabaseContext:
+    @classmethod
+    def setup_class(cls):
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        db_filename = os.path.join(cls.temp_dir.name, "testdbc")
+        aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
+        aeskey = bytes.fromhex(aeskey_hex)
+        cls.db_context = wallet_database.DatabaseContext(db_filename)
+        cls.logger = logs.get_logger(cls.__name__)
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db_context.close()
+        cls.db_context = None
+        cls.temp_dir = None
+
+    def test_write_dispatcher(self) -> None:
+        wd = wallet_database.SqliteWriteDispatcher(self.db_context)
+        wd.stop()

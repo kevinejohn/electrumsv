@@ -265,10 +265,11 @@ class Abstract_Wallet:
         parent_wallet.add_child_wallet(instance)
         return instance
 
-    def _open_database(self, close_existing: bool=False) -> None:
-        if close_existing:
-            self._datastore.close()
+    def _open_database(self) -> None:
         self._datastore = self._parent_wallet.get_wallet_datastore(self._id)
+
+    def _close_database(self) -> None:
+        self._datastore.close()
 
     def is_wrapped_legacy_wallet(self):
         return True
@@ -1223,6 +1224,7 @@ class Abstract_Wallet:
             self._wallet_data['stored_height'] = self.get_local_height()
             self.network = None
         self.save_external_data()
+        self._datastore.close()
 
     def can_export(self) -> bool:
         return not self.is_watching_only() and hasattr(self.get_keystore(), 'get_private_key')
@@ -2015,6 +2017,7 @@ class ParentWallet:
     def __init__(self, storage: WalletStorage,
             creation_type: Optional[str]=None) -> None:
         self._storage = storage
+        self._db_context = storage.get_db_context()
         self._logger = logs.get_logger(f"wallet[{self.name()}]")
 
         self.tx_store_aeskey_bytes = bytes.fromhex(self._storage.get('tx_store_aeskey'))
@@ -2027,9 +2030,15 @@ class ParentWallet:
         return klass(storage, ParentWalletKinds.LEGACY)
 
     def move_to(self, new_path: str) -> None:
-        self._storage.move_to(new_path)
         for child_wallet in self._child_wallets:
-            child_wallet._open_database(close_existing=True)
+            child_wallet._close_database()
+        self._db_context = None
+
+        self._storage.move_to(new_path)
+
+        self._db_context = self._storage.get_db_context()
+        for child_wallet in self._child_wallets:
+            child_wallet._open_database()
 
     def load_state(self, creation_type: Optional[str]=None) -> None:
         self._type = self._storage.get("type", creation_type)
@@ -2064,7 +2073,7 @@ class ParentWallet:
         self._storage.write()
 
     def get_wallet_datastore(self, wallet_id: int) -> WalletData:
-        return WalletData(self.get_storage_path(), self.tx_store_aeskey_bytes, wallet_id)
+        return WalletData(self._db_context, self.tx_store_aeskey_bytes, wallet_id)
 
     def get_next_child_wallet_id(self) -> int:
         return len(self._child_wallets)
@@ -2172,6 +2181,7 @@ class ParentWallet:
         for wallet in self.get_child_wallets():
             wallet.stop()
         self._storage.write()
+        self._storage.close()
 
     def create_gui_handlers(self, window: 'ElectrumWindow') -> None:
         for wallet in self.get_child_wallets():
