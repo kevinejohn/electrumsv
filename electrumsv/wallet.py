@@ -374,6 +374,11 @@ class Abstract_Wallet:
 
     @profiler
     def load_external_data(self):
+        self._live_keys = []
+        self._txdelta_entries = []
+
+    # ...
+
         # TODO: ACCOUNTS: This is a per-account database on the same file under the multi-account
         # paradigm. It needs to share access in that case. It is possible the parent wallet needs
         # to be the place where it is obtained. Each child wallet can hold a reference.

@@ -1,6 +1,7 @@
 import os
 import pytest
 import tempfile
+import threading
 from typing import Tuple, Optional, List
 
 import bitcoinx
@@ -1584,22 +1585,180 @@ class TestXputCache:
             assert 0 == len(entries)
 
 
-class TestDatabaseContext:
+class TestSqliteWriteDispatcher:
+    @classmethod
+    def setup_method(self):
+        self.dispatcher = None
+        self._logger = logs.get_logger("...")
+        class DbConnection:
+            def __enter__(self, *args, **kwargs):
+                pass
+            def __exit__(self, *args, **kwargs):
+                pass
+        class DbContext:
+            def acquire_connection(self):
+                return DbConnection()
+            def release_connection(self, conn):
+                pass
+        self.db_context = DbContext()
+
+    @classmethod
+    def teardown_method(self):
+        if self.dispatcher is not None:
+            self.dispatcher.stop()
+
+    # As we use threading pytest can deadlock if something errors. This will break the deadlock
+    # and display stacktraces.
+    @pytest.mark.timeout(5)
+    def test_write_dispatcher_to_completion(self) -> None:
+        self.dispatcher = wallet_database.SqliteWriteDispatcher(self.db_context)
+        self.dispatcher._writer_loop_event.wait()
+
+        _completion_callback_called = False
+        def _completion_callback():
+            nonlocal _completion_callback_called
+            _completion_callback_called = True
+
+        _write_callback_called = False
+        def _write_callback(conn):
+            nonlocal _write_callback_called
+            _write_callback_called = True
+            return _completion_callback
+
+        self.dispatcher.put(_write_callback)
+        self.dispatcher.stop()
+
+        assert _write_callback_called
+        assert _completion_callback_called
+
+    # As we use threading pytest can deadlock if something errors. This will break the deadlock
+    # and display stacktraces.
+    @pytest.mark.timeout(5)
+    def test_write_dispatcher_write_only(self) -> None:
+        self.dispatcher = wallet_database.SqliteWriteDispatcher(self.db_context)
+        self.dispatcher._writer_loop_event.wait()
+
+        _write_callback_called = False
+        def _write_callback(conn):
+            nonlocal _write_callback_called
+            _write_callback_called = True
+            return None
+
+        self.dispatcher.put(_write_callback)
+        self.dispatcher.stop()
+
+        assert _write_callback_called
+
+
+class TestTxDelta:
     @classmethod
     def setup_class(cls):
         cls.temp_dir = tempfile.TemporaryDirectory()
-        db_filename = os.path.join(cls.temp_dir.name, "testdbc")
+        db_filename = os.path.join(cls.temp_dir.name, "testtxd")
         aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
         aeskey = bytes.fromhex(aeskey_hex)
         cls.db_context = wallet_database.DatabaseContext(db_filename)
-        cls.logger = logs.get_logger(cls.__name__)
+        cls.table = wallet_database.TxDeltaTable(cls.db_context, aeskey)
 
     @classmethod
     def teardown_class(cls):
+        cls.table.close()
+        cls.table = None
         cls.db_context.close()
         cls.db_context = None
         cls.temp_dir = None
 
-    def test_write_dispatcher(self) -> None:
-        wd = wallet_database.SqliteWriteDispatcher(self.db_context)
-        wd.stop()
+    def setup_method(self):
+        # Ensure every test starts from a clean slate.
+        db = self.table._db
+        db.execute(f"DELETE FROM {self.table._table_name}")
+        db.commit()
+
+        self.completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self.completion_event.set()
+
+    def test_txdelta_get_all_empty(self) -> None:
+        entries = self.table.get_all()
+        assert type(entries) is list and len(entries) == 0
+
+    # As we use threading pytest can deadlock if something errors. This will break the deadlock
+    # and display stacktraces.
+    @pytest.mark.timeout(5)
+    def test_txdelta_add(self) -> None:
+        self.table.add([ (1, b'tx_hash', 2) ], self._completion_callback)
+        self.completion_event.wait()
+
+        entries = self.table.get_all()
+        assert len(entries) == 1
+
+        entry = entries[0]
+        assert len(entry) == 3
+
+        assert entry[0] == 1
+        assert entry[1] == b'tx_hash'
+        assert entry[2] == 2
+
+    # As we use threading pytest can deadlock if something errors. This will break the deadlock
+    # and display stacktraces.
+    @pytest.mark.timeout(5)
+    def test_txdelta_add_twice(self) -> None:
+        self.table.add([ (1, b'tx_hash', 2) ], self._completion_callback)
+        self.completion_event.wait()
+
+        self.table.add([ (1, b'tx_hash', 2) ], self._completion_callback)
+
+        entries = self.table.get_all()
+        assert len(entries) == 1
+
+        # The second row will be rejected because of conflict.
+        entry = entries[0]
+        assert entry[0] == 1
+        assert entry[1] == b'tx_hash'
+        assert entry[2] == 2
+
+    # As we use threading pytest can deadlock if something errors. This will break the deadlock
+    # and display stacktraces.
+    @pytest.mark.timeout(5)
+    def test_txdelta_update_one(self) -> None:
+        db = self.table._db
+        db.execute(self.table._CREATE_SQL, (1, b'tx_hash_1', 2, 999, 999))
+        db.execute(self.table._CREATE_SQL, (2, b'tx_hash_2', 3, 999, 999))
+        db.commit()
+
+        self.table.update([ (1, b'tx_hash_1', 5) ], self._completion_callback)
+        self.completion_event.wait()
+
+        entries = self.table.get_all()
+        assert len(entries) == 2
+        entries = sorted(entries)
+
+        assert entries[0][0] == 1
+        assert entries[0][1] == b'tx_hash_1'
+        assert entries[0][2] == 5
+
+        assert entries[1][0] == 2
+        assert entries[1][1] == b'tx_hash_2'
+        assert entries[1][2] == 3
+
+    # As we use threading pytest can deadlock if something errors. This will break the deadlock
+    # and display stacktraces.
+    @pytest.mark.timeout(5)
+    def test_txdelta_delete(self) -> None:
+        db = self.table._db
+        db.execute(self.table._CREATE_SQL, (1, b'tx_hash_1', 2, 999, 999))
+        db.execute(self.table._CREATE_SQL, (2, b'tx_hash_2', 3, 999, 999))
+        db.commit()
+
+        self.table.delete([ (1, b'tx_hash_1') ], self._completion_callback)
+        self.completion_event.wait()
+
+        entries = self.table.get_all()
+        assert len(entries) == 1
+        entries = sorted(entries)
+
+        assert entries[0][0] == 2
+        assert entries[0][1] == b'tx_hash_2'
+        assert entries[0][2] == 3
+

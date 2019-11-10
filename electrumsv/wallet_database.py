@@ -19,8 +19,8 @@ import random
 import sqlite3
 import threading
 import time
+import traceback
 from typing import Optional, Dict, Set, Iterable, List, Tuple, Union, Any, Callable
-import weakref
 
 import bitcoinx
 
@@ -123,19 +123,21 @@ class WriteDisabledError(Exception):
     pass
 
 
-WriteCallbackType = Callable[[], None]
+WriteCallbackType = Callable[[sqlite3.Connection], None]
+CompletionCallbackType = Callable[[], None]
 
 class SqliteWriteDispatcher:
     def __init__(self, db_context: "DatabaseContext") -> None:
         self._db_context = db_context
-        self._db = db_context.acquire_connection()
+        self._logger = logs.get_logger(self.__class__.__name__)
+        self._logger.debug("1")
 
         self._writer_queue = queue.Queue()
         self._writer_thread = threading.Thread(target=self._writer_thread_main, daemon=True)
-        self._writer_started = threading.Event()
+        self._writer_loop_event = threading.Event()
         self._callback_queue = queue.Queue()
         self._callback_thread = threading.Thread(target=self._callback_thread_main, daemon=True)
-        self._callback_started = threading.Event()
+        self._callback_loop_event = threading.Event()
 
         self._allow_puts = True
         self._is_alive = True
@@ -145,64 +147,100 @@ class SqliteWriteDispatcher:
         self._callback_thread.start()
 
     def _writer_thread_main(self) -> None:
-        self._writer_started.set()
-        while self._is_alive:
-            # A perpetually blocking get will not get interrupted by CTRL+C.
-            try:
-                sql: str
-                params: Any
-                safe_callback: Optional[weakref.ReferenceType]
-                sql, params, safe_callback = self._writer_queue.get(timeout=0.1)
-            except queue.Empty:
-                if self._exit_when_empty:
-                    return
-                continue
-            self._db.execute(sql, params)
-            self._db.commit()
+        self._db = self._db_context.acquire_connection()
 
-            if safe_callback is not None:
-                self._callback_queue.put_nowait(safe_callback)
+        # NOTE(rt12): Do not increase. If a higher batch size hits an integrity error and is rolled
+        # back, we will need to apply the existing `write_callbacks` one by one, and not apply
+        # them all which still requires some special handling as with the existing logic we'll
+        # just reapply the same batch on the next loop.
+        # NOTE(rt12): Before increasing verify that the neither Sqlite or sqlite3 do autocommit
+        # on every statement. This really needs a unit test.
+        maximum_batch_size = 1
+        write_callbacks: List[WriteCallbackType] = []
+        while self._is_alive:
+            self._writer_loop_event.set()
+
+            # Block until we have at least one write action. If we already have write actions at
+            # this point, it is because we need to retry after a transaction was rolled back.
+            if len(write_callbacks) == 0:
+                try:
+                    write_callback: WriteCallbackType = self._writer_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._exit_when_empty:
+                        return
+                    continue
+                write_callbacks.append(write_callback)
+
+            # Gather the rest of the batch for this transaction.
+            while len(write_callbacks) < maximum_batch_size and not self._writer_queue.empty():
+                write_callbacks.append(self._writer_queue.get_nowait())
+
+            # Using the connection as a context manager, apply the batch as a transaction.
+            completion_callbacks = []
+            try:
+                with self._db:
+                    for write_callback in write_callbacks:
+                        completion_callback = write_callback(self._db)
+                        if completion_callback is not None:
+                            completion_callbacks.append(completion_callback)
+            except sqlite3.IntegrityError as e:
+                self._logger.exception("Database write failure", exc_info=e)
+                # The transaction was rolled back.
+                if maximum_batch_size > 1:
+                    self._logger.debug("Retrying with batch size of 1")
+                    # We're going to try and reapply the write actions one by one.
+                    maximum_batch_size = 1
+                    continue
+                # We applied the batch actions one by one. If there was an error with this action
+                # then we've logged it, so we can discard it for lack of any other option.
+                write_callbacks.clear()
+                continue
+            else:
+                # The transaction was successfully committed.
+                write_callbacks.clear()
+
+            for completion_callback in completion_callbacks:
+                self._callback_queue.put_nowait(completion_callback)
 
     def _callback_thread_main(self) -> None:
-        self._callback_started.set()
         while self._is_alive:
+            self._callback_loop_event.set()
+
             # A perpetually blocking get will not get interrupted by CTRL+C.
             try:
-                safe_callback: Optional[weakref.ReferenceType]
-                safe_callback = self._callback_queue.get(timeout=0.1)
+                callback: CompletionCallbackType = self._callback_queue.get(timeout=0.1)
             except queue.Empty:
                 if self._exit_when_empty:
                     return
                 continue
-            self._dispatch_callback(safe_callback)
 
-    def _dispatch_callback(self, safe_callback: weakref.ReferenceType) -> None:
-        # Resolve the callback if it is still alive, otherwise we'll get `None`.
-        callback: WriteCallbackType = safe_callback()
-        if callback is not None:
-            callback()
+            try:
+                callback()
+            except Exception as e:
+                self._logger.exception("Exception within completion callback", exc_info=e)
 
-    def put(self, sql, params, callback: Optional[WriteCallbackType]=None) -> None:
+    def put(self, write_callback: Optional[WriteCallbackType]=None) -> None:
         # If the writer is closed, then it is expected the caller should have made sure that
         # no more puts will be made, and the error will only be raised if something puts to
         # flag that it is wrong.
         if not self._allow_puts:
             raise WriteDisabledError()
 
-        safe_callback = weakref.ref(callback) if callback is not None else None
-        item = sql, params, safe_callback
-        self._writer_queue.put_nowait(item)
+        self._writer_queue.put_nowait(write_callback)
 
     def stop(self) -> None:
+        if self._exit_when_empty:
+            return
+
         self._allow_puts = False
         self._exit_when_empty = True
 
         # Wait for both threads to exit.
-        self._writer_started.wait()
+        self._writer_loop_event.wait()
         self._writer_thread.join()
         self._db_context.release_connection(self._db)
         self._db = None
-        self._callback_started.wait()
+        self._callback_loop_event.wait()
         self._callback_thread.join()
 
         self._is_alive = False
@@ -228,6 +266,9 @@ class DatabaseContext:
     def release_connection(self, connection: sqlite3.Connection) -> None:
         self._connections.remove(connection)
         connection.close()
+
+    def queue_write(self, write_callback: WriteCallbackType) -> None:
+        self._write_dispatcher.put(write_callback)
 
     def close(self) -> None:
         self._write_dispatcher.stop()
@@ -647,13 +688,23 @@ class ObjectKeyValueStore(GenericKeyValueStore):
         super().delete_value(key, self._pack_value(value))
 
 
+class TxDelta(namedtuple("TxDeltaTuple", "key_id tx_hash value_delta")):
+    # namedtuple comes with a similar representation, but bytes are not hex encoded.
+    def __repr__(self):
+        return (f"TxDelta(key_id={self.key_id}, tx_hash={self.tx_hash.hex()}, "+
+            f"value_delta={self.value_delta})")
+
+# namedtuple defaults do not get added until 3.7, and are not available in 3.6, so we set them
+# indirectly to be compatible by both.
+TxDelta.__new__.__defaults__ = (0, b'\0' * 32, 0)
+
 
 class TxDeltaTable(BaseWalletStore):
-    def __init__(self, db_context: DatabaseContext, aeskey: Optional[bytes],
+    def __init__(self, db_context: DatabaseContext,
             migration_context: Optional[MigrationContext]=None) -> None:
         self._logger = logs.get_logger("txdelta-table")
 
-        super().__init__("txdelta", db_context, aeskey, migration_context=migration_context)
+        super().__init__("txdelta", db_context, None, migration_context=migration_context)
 
     def has_unique_keys(self) -> bool:
         return True
@@ -673,24 +724,61 @@ class TxDeltaTable(BaseWalletStore):
             "ON "+ table_name +"(KeyId, TxHash)")
         self._CREATE_SQL = ("INSERT INTO "+ table_name +" "+
             "(KeyId, TxHash, ValueDelta, DateCreated, DateUpdated) VALUES (?, ?, ?, ?, ?)")
-        self._READ_SQL = ("SELECT ValueDelta FROM "+ table_name +" "+
-            "WHERE KeyId=? AND TxHash=?")
+        # self._READ_SQL = ("SELECT ValueDelta FROM "+ table_name +" "+
+        #     "WHERE KeyId=? AND TxHash=?")
         self._READ_ALL_SQL = ("SELECT KeyId, TxHash, ValueDelta FROM "+ table_name)
-        self._READ_ROW_SQL = ("SELECT ValueDelta, DateCreated, DateUpdated "+
-            "FROM "+ table_name +" WHERE KeyId=? AND TxHash=?")
+        # self._READ_ROW_SQL = ("SELECT ValueDelta, DateCreated, DateUpdated "+
+        #     "FROM "+ table_name +" WHERE KeyId=? AND TxHash=?")
         self._UPDATE_SQL = ("UPDATE "+ table_name +" SET ValueDelta=?, DateUpdated=? "+
             "WHERE KeyId=? AND TxHash=?")
-        self._UPSERT_SQL = (self._CREATE_SQL +" ON CONFLICT(KeyId, TxHash) DO UPDATE "+
-            "SET ValueDelta=excluded.ValueDelta, DateUpdated=excluded.DateUpdated")
-        self._DELETE_SQL = ("DELETE FROM "+ table_name +" "+
-            "WHERE KeyId=? AND AND TxHash=?")
+        # self._UPSERT_SQL = (self._CREATE_SQL +" ON CONFLICT(KeyId, TxHash) DO UPDATE "+
+        #     "SET ValueDelta=excluded.ValueDelta, DateUpdated=excluded.DateUpdated")
+        self._DELETE_SQL = ("DELETE FROM "+ table_name +" WHERE KeyId=? AND TxHash=?")
 
     def _db_create(self, db: sqlite3.Connection) -> None:
         db.execute(self._CREATE_TABLE_SQL)
         if self.has_unique_keys():
             db.execute(self._CREATE_INDEX_SQL)
 
+    @tprofiler
+    def get_all(self) -> Optional[bytes]:
+        cursor = self._db.execute(self._READ_ALL_SQL)
+        return cursor.fetchall()
 
+    @tprofiler
+    def add(self, entries: Iterable[Tuple[int, bytes, int]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        timestamp = self._get_current_timestamp()
+        datas = []
+        for key_id, tx_hash, value_delta in entries:
+            datas.append((key_id, tx_hash, value_delta, timestamp, timestamp))
+        def _write(db: sqlite3.Connection):
+            db.executemany(self._CREATE_SQL, datas)
+            return completion_callback
+        self._db_context.queue_write(_write)
+
+    @tprofiler
+    def update(self, entries: Iterable[Tuple[int, bytes, int]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        timestamp = self._get_current_timestamp()
+        datas = []
+        for key_id, tx_hash, value_delta in entries:
+            datas.append((value_delta, timestamp, key_id, tx_hash))
+        def _write(db: sqlite3.Connection):
+            c = db.executemany(self._UPDATE_SQL, datas)
+            return completion_callback
+        self._db_context.queue_write(_write)
+
+    @tprofiler
+    def delete(self, entries: Iterable[Tuple[int, bytes]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        datas = []
+        for key_id, tx_hash in entries:
+            datas.append((key_id, tx_hash))
+        def _write(db: sqlite3.Connection):
+            db.executemany(self._DELETE_SQL, datas)
+            return completion_callback
+        self._db_context.queue_write(_write)
 
 
 class AbstractTransactionXput(ABC):
@@ -1819,6 +1907,55 @@ class TxCache:
             return len(store_updates)
 
 
+class TxDeltaCache:
+    _is_authoritative = False
+
+    def __init__(self, store: TxDeltaTable, tx_cache: TxCache, authoritative: bool=True) -> None:
+        self._logger = logs.get_logger("txdelta-cache")
+        self._store = store
+        self._tx_cache = tx_cache
+
+        self._lock = threading.RLock()
+
+        if authoritative:
+            # Prime the cache with metadata for all transactions.
+            self.logger.debug("Caching all existing entries")
+            self._data = self._store.get_all()
+            self._data_keys = [ (entry[0], entry[1]) for entry in self._data ]
+            self._is_authoritative = True
+            self.logger.debug("Cached all existing entries")
+        else:
+            self._data = []
+            raise NotImplementedError()
+
+    def get_all(self) -> List[Tuple[int, bytes, int]]:
+        return self._data
+
+    def set_many(self, entries: List[TxDelta]) -> None:
+        with self.lock:
+            adds = []
+            updates = []
+            for entry in entries:
+                entry_key = (entry[0], entry[1])
+                try:
+                    entry_index = self._data_keys.index(entry_key)
+                except ValueError:
+                    adds.append(entry)
+                    self._data.append(entry)
+                    self._data_keys.append(entry_key)
+                else:
+                    updates.append(entry)
+                    self._data[entry_index] = entry
+
+        if len(adds):
+            self._store.add(adds)
+        if len(updates):
+            self._store.update(updates)
+
+    def delete_many(self, entries: List[TxDelta]) -> None:
+        pass
+
+
 class WalletData:
     def __init__(self, db_context: DatabaseContext, aeskey: bytes, subwallet_id: int,
             migration_context: Optional[MigrationContext]=None) -> None:
@@ -1830,6 +1967,7 @@ class WalletData:
             migration_context)
         self.misc_store = ObjectKeyValueStore("HotData", db_context, aeskey, subwallet_id,
             migration_context)
+        self.txdelta_store = TxDeltaTable(db_context, migration_context)
 
         self.tx_cache = TxCache(self.tx_store)
         self.txin_cache = TxXputCache(self.txin_store, "txins")
@@ -1842,7 +1980,7 @@ class WalletData:
         self.misc_store.close()
 
     @property
-    def tx(self) -> TransactionStore:
+    def tx(self) -> TxCache:
         return self.tx_cache
 
     @property
@@ -1852,6 +1990,10 @@ class WalletData:
     @property
     def txout(self) -> TxXputCache:
         return self.txout_cache
+
+    @property
+    def txdelta(self) -> TxDeltaTable:
+        return self.txdelta_store
 
     @property
     def misc(self) -> ObjectKeyValueStore:
