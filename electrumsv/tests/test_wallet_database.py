@@ -537,6 +537,11 @@ class TestTransactionStore:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
+        self._completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self._completion_event.set()
+
     def test_create_db_passive(self):
         # This has already run on TransactionStore creation. We test that it does not error being
         # run again, if the database entities already exist.
@@ -545,10 +550,16 @@ class TestTransactionStore:
     def test_has_for_missing_transaction(self):
         assert not self.store.has(self.tx_id)
 
+    # As we use threading pytest can deadlock if something errors. This will break the deadlock
+    # and display stacktraces.
+    @pytest.mark.timeout(5)
     def test_has_for_existing_transaction(self):
         metadata = TxData()
         bytedata = os.urandom(100)
-        self.store.add(self.tx_id, metadata, bytedata)
+        self.store.add(self.tx_id, metadata, bytedata,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+
         assert self.store.has(self.tx_id)
 
     def test_data_serialization(self):
@@ -598,12 +609,15 @@ class TestTransactionStore:
         assert proof1.position == proof2.position
         assert proof1.branch == proof2.branch
 
+    @pytest.mark.timeout(5)
     def test_add(self):
         bytedata_1 = os.urandom(10)
         tx_hash_bytes = bitcoinx.double_sha256(bytedata_1)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         metadata_1 = TxData(height=None, fee=None, position=None, timestamp=None)
-        self.store.add(tx_id, metadata_1, bytedata_1, flags=TxFlags.StateDispatched)
+        self.store.add(tx_id, metadata_1, bytedata_1, flags=TxFlags.StateDispatched,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         # Check the state is correct, all states should be the same code path.
         flags = self.store.get_flags(tx_id)
@@ -613,6 +627,7 @@ class TestTransactionStore:
         assert metadata_1 == metadata_2
         assert bytedata_1 == bytedata_2
 
+    @pytest.mark.timeout(5)
     def test_add_many(self):
         to_add = []
         for i in range(10):
@@ -621,25 +636,35 @@ class TestTransactionStore:
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             tx_data = TxData(height=1, fee=2, position=None, timestamp=None)
             to_add.append((tx_id, tx_data, tx_bytes, TxFlags.Unset))
-        self.store.add_many(to_add)
+        self.store.add_many(to_add, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         existing_tx_ids = self.store.get_ids()
         added_tx_ids = set(t[0] for t in to_add)
         assert added_tx_ids == existing_tx_ids
 
+    @pytest.mark.timeout(5)
     def test_update(self):
         bytedata = os.urandom(10)
         tx_hash_bytes = bitcoinx.double_sha256(bytedata)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         metadata_a = TxData(height=None, fee=None, position=None, timestamp=None)
-        self.store.add(tx_id, metadata_a, bytedata)
+        self.store.add(tx_id, metadata_a, bytedata, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         metadata_update = TxData(height=None, fee=100, position=None, timestamp=None)
-        self.store.update(tx_id, metadata_update, bytedata)
+        self.store.update(tx_id, metadata_update, bytedata,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         metadata_get, bytedata_get, flags = self.store.get(tx_id)
         assert metadata_update == metadata_get
         assert bytedata == bytedata_get
 
+    @pytest.mark.timeout(5)
     def test_update_many(self):
         to_add = []
         for i in range(10):
@@ -648,13 +673,17 @@ class TestTransactionStore:
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             tx_data = TxData(height=None, fee=2, position=None, timestamp=None)
             to_add.append((tx_id, tx_data, tx_bytes, TxFlags.Unset))
-        self.store.add_many(to_add)
+        self.store.add_many(to_add, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         to_update = []
         for tx_id, metadata, tx_bytes, flags in to_add:
             tx_metadata = TxData(height=1, fee=2, position=None, timestamp=None)
             to_update.append((tx_id, tx_metadata, tx_bytes, flags))
-        self.store.update_many(to_update)
+        self.store.update_many(to_update, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         for tx_id_get, metadata_get, bytedata_get, flags_get in self.store.get_many():
             for update_tx_id, update_metadata, update_tx_bytes, update_flags in to_update:
@@ -663,12 +692,15 @@ class TestTransactionStore:
                     assert bytedata_get == update_tx_bytes
                     continue
 
+    @pytest.mark.timeout(5)
     def test_update_flags(self):
         bytedata = os.urandom(10)
         tx_hash_bytes = bitcoinx.double_sha256(bytedata)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         metadata = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, metadata, bytedata)
+        self.store.add(tx_id, metadata, bytedata, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         # Verify the field flags are assigned correctly on the add.
         expected_flags = TxFlags.HasFee | TxFlags.HasHeight | TxFlags.HasByteData
@@ -677,7 +709,9 @@ class TestTransactionStore:
 
         flags = TxFlags.StateReceived
         mask = TxFlags.METADATA_FIELD_MASK | TxFlags.HasByteData | TxFlags.HasProofData
-        self.store.update_flags(tx_id, flags, mask)
+        self.store.update_flags(tx_id, flags, mask, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         # Verify the state flag is correctly added via the mask.
         flags_get = self.store.get_flags(tx_id)
@@ -687,22 +721,33 @@ class TestTransactionStore:
 
         flags = TxFlags.StateReceived
         mask = TxFlags.Unset
-        self.store.update_flags(tx_id, flags, mask)
+        self.store.update_flags(tx_id, flags, mask, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         # Verify the state flag is correctly set via the mask.
         flags = self.store.get_flags(tx_id)
         assert TxFlags.StateReceived == flags
 
+    @pytest.mark.timeout(5)
     def test_delete(self):
         tx_bytes = os.urandom(10)
         tx_hash_bytes = bitcoinx.double_sha256(tx_bytes)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         data = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, data, tx_bytes)
+        self.store.add(tx_id, data, tx_bytes, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert self.store.has(tx_id)
-        self.store.delete(tx_id)
+
+        self.store.delete(tx_id, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert not self.store.has(tx_id)
 
+    @pytest.mark.timeout(5)
     def test_delete_many(self):
         to_add = []
         for i in range(10):
@@ -711,14 +756,21 @@ class TestTransactionStore:
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             metadata = TxData(height=1, fee=2, position=None, timestamp=None)
             to_add.append((tx_id, metadata, bytedata, TxFlags.Unset))
-        self.store.add_many(to_add)
+        self.store.add_many(to_add, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         add_ids = set(t[0] for t in to_add)
         get_ids = self.store.get_ids()
         assert add_ids == get_ids
-        self.store.delete_many(add_ids)
+        self.store.delete_many(add_ids, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         get_ids = self.store.get_ids()
         assert 0 == len(get_ids)
 
+    @pytest.mark.timeout(5)
     def test_get_all_pending(self):
         get_tx_ids = set([])
         for tx_hex in (tx_hex_1, tx_hex_2):
@@ -726,17 +778,23 @@ class TestTransactionStore:
             tx_hash_bytes = bitcoinx.double_sha256(bytedata)
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             metadata = TxData(height=1, fee=2, position=None, timestamp=None)
-            self.store.add(tx_id, metadata, bytedata)
+            self.store.add(tx_id, metadata, bytedata, completion_callback=self._completion_callback)
+            self._completion_event.wait()
+            self._completion_event.clear()
             get_tx_ids.add(tx_id)
+
         result_tx_ids = self.store.get_ids()
         assert get_tx_ids == result_tx_ids
 
+    @pytest.mark.timeout(5)
     def test_get(self):
         bytedata = os.urandom(10)
         tx_hash_bytes = bitcoinx.double_sha256(bytedata)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         metadata = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, metadata, bytedata)
+        self.store.add(tx_id, metadata, bytedata, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         assert self.store.has(tx_id)
         assert self.store.get(tx_id)[0] is not None
@@ -745,12 +803,15 @@ class TestTransactionStore:
         assert self.store.get(tx_id, TxFlags.HasFee, TxFlags.HasFee) is not None
         assert self.store.get(tx_id, TxFlags.Unset, TxFlags.HasFee) is None
 
+    @pytest.mark.timeout(5)
     def test_get_metadata(self) -> None:
         bytedata = os.urandom(10)
         tx_hash_bytes = bitcoinx.double_sha256(bytedata)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         metadata = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, metadata, bytedata)
+        self.store.add(tx_id, metadata, bytedata, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         rowdata = self.store.get_metadata(tx_id)
         assert rowdata is not None
@@ -762,17 +823,22 @@ class TestTransactionStore:
         assert metadata.position is None
         assert metadata.timestamp is None
 
+    @pytest.mark.timeout(5)
     def test_get_metadata_many(self) -> None:
         # We're going to add five matches and look for two of them, checking that we do not match
         # unwanted rows.
         all_tx_ids = []
+        datas = []
         for i in range(5):
             bytedata = os.urandom(10)
             tx_hash_bytes = bitcoinx.double_sha256(bytedata)
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             metadata = TxData(height=i*100, fee=i*1000, position=None, timestamp=None)
-            self.store.add(tx_id, metadata, bytedata)
+            datas.append((tx_id, metadata, bytedata, TxFlags.Unset))
             all_tx_ids.append(tx_id)
+        self.store.add_many(datas, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         # We also ask for a dud tx_id that won't get matched.
         select_tx_ids = [ all_tx_ids[0], all_tx_ids[3], "12121212" ]
@@ -788,24 +854,31 @@ class TestTransactionStore:
             assert metadata.position is None
             assert metadata.timestamp is None
 
+    @pytest.mark.timeout(5)
     def test_update_metadata_many(self) -> None:
         # We're going to add five matches and look for two of them, checking that we do not match
         # unwanted rows.
         all_tx_ids = []
+        datas = []
         for i in range(5):
             bytedata = os.urandom(10)
             tx_hash_bytes = bitcoinx.double_sha256(bytedata)
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             metadata = TxData(height=i*100, fee=i*1000, position=None, timestamp=None)
-            self.store.add(tx_id, metadata, bytedata)
+            datas.append((tx_id, metadata, bytedata, TxFlags.Unset))
             all_tx_ids.append(tx_id)
+        self.store.add_many(datas, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         updates = []
         for i in range(5):
             tx_id = all_tx_ids[i]
             metadata = TxData(height=i*200, fee=i*2000, position=None, timestamp=None)
             updates.append((tx_id, metadata, TxFlags.HasHeight | TxFlags.HasFee))
-        self.store.update_metadata_many(updates)
+        self.store.update_metadata_many(updates, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         # We also ask for a dud tx_id that won't get matched.
         select_tx_ids = [ all_tx_ids[0], all_tx_ids[3], "12121212" ]
@@ -821,6 +894,7 @@ class TestTransactionStore:
             assert metadata.position is None
             assert metadata.timestamp is None
 
+    @pytest.mark.timeout(5)
     def test_get_many(self):
         to_add = []
         for i in range(10):
@@ -829,7 +903,9 @@ class TestTransactionStore:
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             tx_data = TxData(height=None, fee=2, position=None, timestamp=None)
             to_add.append((tx_id, tx_data, tx_bytes, TxFlags.HasFee))
-        self.store.add_many(to_add)
+        self.store.add_many(to_add, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         # Test the first "add" id is matched.
         matches = self.store.get_many(tx_ids=[to_add[0][0]])
@@ -852,17 +928,22 @@ class TestTransactionStore:
         matches = self.store.get_many(flags=TxFlags.Unset, mask=TxFlags.HasFee)
         assert 0 == len(matches)
 
+    @pytest.mark.timeout(5)
     def test_proof(self):
         bytedata = os.urandom(10)
         tx_hash_bytes = bitcoinx.double_sha256(bytedata)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         metadata = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, metadata, bytedata)
+        self.store.add(tx_id, metadata, bytedata, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         position1 = 10
         merkle_branch1 = [ os.urandom(32) for i in range(10) ]
         proof = TxProof(position1, merkle_branch1)
-        self.store.update_proof(tx_id, proof)
+        self.store.update_proof(tx_id, proof, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         with pytest.raises(wallet_database.MissingRowError):
             self.store.get_proof(self.tx_id)
@@ -900,6 +981,11 @@ class TestTxCache:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
+        self._completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self._completion_event.set()
+
     def test_entry_visible(self):
         cache = TxCache(self.store)
 
@@ -916,6 +1002,7 @@ class TestTxCache:
             actual_result = cache._entry_visible(flag_bits, flags, mask)
             assert result == actual_result, str(combos[i])
 
+    @pytest.mark.timeout(5)
     def test_add_missing_transaction(self):
         cache = TxCache(self.store)
 
@@ -923,7 +1010,11 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(tx_bytes_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
 
-        cache.add_missing_transaction(tx_id_1, 100, 94)
+        cache.add_missing_transaction(tx_id_1, 100, 94,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert cache.is_cached(tx_id_1)
         entry = cache.get_entry(tx_id_1)
         assert TxFlags.HasFee | TxFlags.HasHeight, entry.flags & TxFlags.METADATA_FIELD_MASK
@@ -933,47 +1024,67 @@ class TestTxCache:
         tx_hash_bytes_2 = bitcoinx.double_sha256(tx_bytes_2)
         tx_id_2 = bitcoinx.hash_to_hex_str(tx_hash_bytes_2)
 
-        cache.add_missing_transaction(tx_id_2, 200)
+        cache.add_missing_transaction(tx_id_2, 200,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert cache.is_cached(tx_id_2)
         entry = cache.get_entry(tx_id_2)
         assert TxFlags.HasHeight == entry.flags & TxFlags.METADATA_FIELD_MASK
         assert entry.bytedata is None
 
+    @pytest.mark.timeout(5)
     def test_add_transaction(self):
         cache = TxCache(self.store)
 
         tx = Transaction.from_hex(tx_hex_1)
-        cache.add_transaction(tx)
+        cache.add_transaction(tx, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert cache.is_cached(tx.txid())
         entry = cache.get_entry(tx.txid())
         assert TxFlags.HasByteData == entry.flags & TxFlags.HasByteData
         assert entry.bytedata is not None
 
+    @pytest.mark.timeout(5)
     def test_add_transaction_update(self):
         cache = TxCache(self.store)
 
         tx = Transaction.from_hex(tx_hex_1)
         data = [ tx.txid(), TxData(height=1295924,timestamp=1555296290,position=4,fee=None),
             None, TxFlags.Unset ]
-        cache.add([ data ])
+        cache.add([ data ], completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         entry = cache.get_entry(tx.txid())
         assert entry is not None
         assert TxFlags.Unset == entry.flags & TxFlags.STATE_MASK
 
-        cache.add_transaction(tx, TxFlags.StateCleared)
+        cache.add_transaction(tx, TxFlags.StateCleared,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         entry = cache.get_entry(tx.txid())
         assert entry is not None
         assert entry.bytedata is not None
         assert TxFlags.StateCleared == entry.flags & TxFlags.StateCleared
 
+    @pytest.mark.timeout(5)
     def test_add_then_update(self):
         cache = TxCache(self.store)
 
         bytedata_1 = bytes.fromhex(tx_hex_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(bitcoinx.double_sha256(bytedata_1))
         metadata_1 = TxData(position=11)
-        cache.add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateDispatched) ])
+        cache.add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateDispatched) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert cache.is_cached(tx_id_1)
         entry = cache.get_entry(tx_id_1)
         assert TxFlags.HasByteData | TxFlags.HasPosition | TxFlags.StateDispatched == entry.flags
@@ -981,13 +1092,18 @@ class TestTxCache:
 
         metadata_2 = TxData(fee=10, height=88)
         propagate_flags = TxFlags.HasFee | TxFlags.HasHeight
-        cache.update([ (tx_id_1, metadata_2, None, propagate_flags | TxFlags.HasPosition) ])
+        cache.update([ (tx_id_1, metadata_2, None, propagate_flags | TxFlags.HasPosition) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         entry = cache.get_entry(tx_id_1)
         expected_flags = propagate_flags | TxFlags.StateDispatched | TxFlags.HasByteData
         assert expected_flags == entry.flags, \
             f"{TxFlags.to_repr(expected_flags)} !=  {TxFlags.to_repr(entry.flags)}"
         assert entry.bytedata is not None
 
+    @pytest.mark.timeout(5)
     def test_update_or_add(self):
         cache = TxCache(self.store)
 
@@ -996,7 +1112,11 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(bytedata_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         metadata_1 = TxData()
-        cache.update_or_add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateSettled) ])
+        cache.update_or_add([ (tx_id_1, metadata_1, bytedata_1, TxFlags.StateSettled) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert cache.is_cached(tx_id_1)
         entry = cache.get_entry(tx_id_1)
         assert TxFlags.HasByteData | TxFlags.StateSettled == entry.flags
@@ -1005,7 +1125,11 @@ class TestTxCache:
         # Update.
         metadata_2 = TxData(position=22)
         updated_ids = cache.update_or_add([
-            (tx_id_1, metadata_2, None, TxFlags.HasPosition | TxFlags.StateDispatched) ])
+            (tx_id_1, metadata_2, None, TxFlags.HasPosition | TxFlags.StateDispatched) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         entry = cache.get_entry(tx_id_1)
         store_flags = self.store.get_flags(tx_id_1)
         # State flags if present get set in an update otherwise they remain the same.
@@ -1018,6 +1142,7 @@ class TestTxCache:
         assert metadata_2.position == entry.metadata.position
         assert updated_ids == set([ tx_id_1 ])
 
+    @pytest.mark.timeout(5)
     def test_update_flags(self):
         cache = TxCache(self.store)
 
@@ -1025,13 +1150,21 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(tx_bytes_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         data = TxData(position=11)
-        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateDispatched) ])
+        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateDispatched) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert cache.is_cached(tx_id_1)
         entry = cache.get_entry(tx_id_1)
         assert TxFlags.HasByteData | TxFlags.HasPosition | TxFlags.StateDispatched == entry.flags
         assert entry.bytedata is not None
 
-        cache.update_flags(tx_id_1, TxFlags.StateSettled, TxFlags.HasByteData|TxFlags.HasProofData)
+        cache.update_flags(tx_id_1, TxFlags.StateSettled, TxFlags.HasByteData|TxFlags.HasProofData,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         entry = cache.get_entry(tx_id_1)
         store_flags = self.store.get_flags(tx_id_1)
         expected_flags = TxFlags.HasByteData | TxFlags.HasPosition | TxFlags.StateSettled
@@ -1041,6 +1174,7 @@ class TestTxCache:
             f"{TxFlags.to_repr(expected_flags)} != {TxFlags.to_repr(entry.flags)}"
         assert entry.bytedata is not None
 
+    @pytest.mark.timeout(5)
     def test_delete(self):
         cache = TxCache(self.store)
 
@@ -1048,14 +1182,22 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(tx_bytes_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         data = TxData(position=11)
-        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateDispatched) ])
+        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateDispatched) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert self.store.has(tx_id_1)
         assert cache.is_cached(tx_id_1)
 
-        cache.delete(tx_id_1)
+        cache.delete(tx_id_1, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
+
         assert not self.store.has(tx_id_1)
         assert not cache.is_cached(tx_id_1)
 
+    @pytest.mark.timeout(5)
     def test_uncleared_bytedata_requirements(self) -> None:
         cache = TxCache(self.store)
 
@@ -1067,13 +1209,16 @@ class TestTxCache:
             with pytest.raises(wallet_database.InvalidDataError):
                 cache.add([ (tx_id_1, data, None, state_flag) ])
 
-        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateSigned) ])
+        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateSigned) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         # We are applying a clearing of the bytedata, this should be invalid given uncleared.
         for state_flag in TRANSACTION_FLAGS:
             with pytest.raises(wallet_database.InvalidDataError):
                 cache.update([ (tx_id_1, data, None, state_flag | TxFlags.HasByteData) ])
 
+    @pytest.mark.timeout(5)
     def test_get_flags(self):
         cache = TxCache(self.store)
 
@@ -1083,18 +1228,23 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(tx_bytes_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         data = TxData(position=11)
-        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateDispatched) ])
-        assert cache.is_cached(tx_id_1)
+        cache.add([ (tx_id_1, data, tx_bytes_1, TxFlags.StateDispatched) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
+        assert cache.is_cached(tx_id_1)
         assert TxFlags.StateDispatched | TxFlags.HasByteData | TxFlags.HasPosition == \
             cache.get_flags(tx_id_1)
 
+    @pytest.mark.timeout(5)
     def test_get_metadata(self):
         # Verify that getting a non-cached stored entry's metadata will only load the metadata.
         bytedata_set = os.urandom(10)
         tx_id = bitcoinx.hash_to_hex_str(bitcoinx.double_sha256(bytedata_set))
         metadata_set = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, metadata_set, bytedata_set)
+        self.store.add(tx_id, metadata_set, bytedata_set,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         cache = TxCache(self.store)
         metadata_get = cache.get_metadata(tx_id)
@@ -1107,11 +1257,14 @@ class TestTxCache:
         assert entry.is_metadata_cached()
         assert not entry.is_bytedata_cached()
 
+    @pytest.mark.timeout(5)
     def test_get_transaction_after_metadata(self):
         bytedata_set = os.urandom(10)
         tx_id = bitcoinx.hash_to_hex_str(bitcoinx.double_sha256(bytedata_set))
         metadata_set = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, metadata_set, bytedata_set)
+        self.store.add(tx_id, metadata_set, bytedata_set,
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         cache = TxCache(self.store)
         metadata_get = cache.get_metadata(tx_id)
@@ -1128,18 +1281,22 @@ class TestTxCache:
         cached_entry_2 = cache.get_cached_entry(tx_id)
         assert entry == cached_entry_2
 
+    @pytest.mark.timeout(5)
     def test_get_transaction(self):
         bytedata = bytes.fromhex(tx_hex_1)
         tx_hash_bytes = bitcoinx.double_sha256(bytedata)
         tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
         metadata = TxData(height=1, fee=2, position=None, timestamp=None)
-        self.store.add(tx_id, metadata, bytedata)
+        self.store.add(tx_id, metadata, bytedata, completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         cache = TxCache(self.store)
         tx = cache.get_transaction(tx_id)
         assert tx is not None
         assert tx_id == tx.txid()
 
+    @pytest.mark.timeout(5)
     def test_get_transactions(self):
         tx_ids = []
         for tx_hex in (tx_hex_1, tx_hex_2):
@@ -1147,7 +1304,10 @@ class TestTxCache:
             tx_hash_bytes = bitcoinx.double_sha256(tx_bytes)
             tx_id = bitcoinx.hash_to_hex_str(tx_hash_bytes)
             data = TxData(height=1, fee=2, position=None, timestamp=None)
-            self.store.add(tx_id, data, tx_bytes)
+            self.store.add(tx_id, data, tx_bytes,
+                completion_callback=self._completion_callback)
+            self._completion_event.wait()
+            self._completion_event.clear()
             tx_ids.append(tx_id)
 
         cache = TxCache(self.store)
@@ -1155,6 +1315,7 @@ class TestTxCache:
             assert tx is not None
             assert tx.txid() in  tx_ids
 
+    @pytest.mark.timeout(5)
     def test_get_entry(self):
         cache = TxCache(self.store)
 
@@ -1162,7 +1323,10 @@ class TestTxCache:
         tx_hash_bytes_1 = bitcoinx.double_sha256(bytedata_1)
         tx_id_1 = bitcoinx.hash_to_hex_str(tx_hash_bytes_1)
         data = TxData(position=11)
-        cache.add([ (tx_id_1, data, bytedata_1, TxFlags.StateSettled) ])
+        cache.add([ (tx_id_1, data, bytedata_1, TxFlags.StateSettled) ],
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
 
         entry = cache.get_entry(tx_id_1, TxFlags.StateDispatched)
         assert entry is None
