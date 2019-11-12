@@ -130,7 +130,6 @@ class SqliteWriteDispatcher:
     def __init__(self, db_context: "DatabaseContext") -> None:
         self._db_context = db_context
         self._logger = logs.get_logger(self.__class__.__name__)
-        self._logger.debug("1")
 
         self._writer_queue = queue.Queue()
         self._writer_thread = threading.Thread(target=self._writer_thread_main, daemon=True)
@@ -149,27 +148,26 @@ class SqliteWriteDispatcher:
     def _writer_thread_main(self) -> None:
         self._db = self._db_context.acquire_connection()
 
-        # NOTE(rt12): Do not increase. If a higher batch size hits an integrity error and is rolled
-        # back, we will need to apply the existing `write_callbacks` one by one, and not apply
-        # them all which still requires some special handling as with the existing logic we'll
-        # just reapply the same batch on the next loop.
-        # NOTE(rt12): Before increasing verify that the neither Sqlite or sqlite3 do autocommit
-        # on every statement. This really needs a unit test.
-        maximum_batch_size = 1
+        maximum_batch_size = 10
         write_callbacks: List[WriteCallbackType] = []
+        write_callback_backlog: List[WriteCallbackType] = []
         while self._is_alive:
             self._writer_loop_event.set()
 
-            # Block until we have at least one write action. If we already have write actions at
-            # this point, it is because we need to retry after a transaction was rolled back.
-            if len(write_callbacks) == 0:
+            if len(write_callback_backlog):
+                assert maximum_batch_size == 1
+                write_callbacks = [ write_callback_backlog.pop(0) ]
+            else:
+                # Block until we have at least one write action. If we already have write
+                # actions at this point, it is because we need to retry after a transaction
+                # was rolled back.
                 try:
                     write_callback: WriteCallbackType = self._writer_queue.get(timeout=0.1)
                 except queue.Empty:
                     if self._exit_when_empty:
                         return
                     continue
-                write_callbacks.append(write_callback)
+                write_callbacks = [ write_callback ]
 
             # Gather the rest of the batch for this transaction.
             while len(write_callbacks) < maximum_batch_size and not self._writer_queue.empty():
@@ -179,10 +177,13 @@ class SqliteWriteDispatcher:
             completion_callbacks = []
             try:
                 with self._db:
+                    # We have to force a grouped statement transaction with the explicit 'begin'.
+                    self._db.execute('begin')
                     for write_callback in write_callbacks:
                         completion_callback = write_callback(self._db)
                         if completion_callback is not None:
                             completion_callbacks.append(completion_callback)
+                # The transaction was successfully committed.
             except sqlite3.IntegrityError as e:
                 self._logger.exception("Database write failure", exc_info=e)
                 # The transaction was rolled back.
@@ -190,14 +191,12 @@ class SqliteWriteDispatcher:
                     self._logger.debug("Retrying with batch size of 1")
                     # We're going to try and reapply the write actions one by one.
                     maximum_batch_size = 1
-                    continue
+                    write_callback_backlog = write_callbacks
                 # We applied the batch actions one by one. If there was an error with this action
                 # then we've logged it, so we can discard it for lack of any other option.
-                write_callbacks.clear()
-                continue
             else:
-                # The transaction was successfully committed.
-                write_callbacks.clear()
+                if len(write_callbacks) > 1:
+                    self._logger.debug("Invoked %d write callbacks", len(write_callbacks))
 
             for completion_callback in completion_callbacks:
                 self._callback_queue.put_nowait(completion_callback)
@@ -259,7 +258,8 @@ class DatabaseContext:
         self._write_dispatcher = SqliteWriteDispatcher(self)
 
     def acquire_connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._db_path, check_same_thread=False)
+        connection = sqlite3.connect(self._db_path, check_same_thread=False,
+            isolation_level=None)
         self._connections.append(connection)
         return connection
 
@@ -453,29 +453,30 @@ class GenericKeyValueStore(BaseWalletStore):
             raise Exception("Asked to migrate unexpected versions", context)
 
     @tprofiler
-    def add(self, key: str, value: bytes) -> None:
-        return self._add(key, value)
-
-    def _add(self, key: str, value: bytes) -> None:
-        assert type(value) is bytes
-        ekey = self._encrypt_key(key)
-        evalue = self._encrypt(value)
-        timestamp = self._get_current_timestamp()
-        self._db.execute(self._CREATE_SQL, [self._group_id, ekey, evalue, timestamp, timestamp])
-        self._db.commit()
-        self._logger.debug("add '%s'", key)
+    def add(self, key: str, value: bytes,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        self._add_many([ (key, value) ], completion_callback=completion_callback)
 
     @tprofiler
-    def add_many(self, entries: Iterable[Tuple[str, bytes]]) -> None:
+    def add_many(self, entries: Iterable[Tuple[str, bytes]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        self._add_many(entries, completion_callback)
+
+    def _add_many(self, entries: Iterable[Tuple[str, bytes]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         timestamp = self._get_current_timestamp()
         datas = []
         for key, value in entries:
             assert type(value) is bytes, f"bad value {value}"
             datas.append([ self._group_id, self._encrypt_key(key), self._encrypt(value),
                 timestamp, timestamp])
-        self._db.executemany(self._CREATE_SQL, datas)
-        self._db.commit()
-        self._logger.debug("add_many '%s'", list(t[0] for t in entries))
+
+        def _write(db: sqlite3.Connection) -> None:
+            self._logger.debug("add_many '%s'", list(t[0] for t in entries))
+            db.executemany(self._CREATE_SQL, datas)
+            return completion_callback
+
+        self._db_context.queue_write(_write)
 
     @tprofiler
     def get_value(self, key: str) -> Optional[bytes]:
@@ -533,7 +534,8 @@ class GenericKeyValueStore(BaseWalletStore):
         return None
 
     @tprofiler
-    def upsert(self, key: str, value: bytes) -> None:
+    def upsert(self, key: str, value: bytes,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         if not self.has_unique_keys():
             raise InvalidUpsertError(key)
 
@@ -544,69 +546,102 @@ class GenericKeyValueStore(BaseWalletStore):
             ekey = self._encrypt_key(key)
             evalue = self._encrypt(value)
             timestamp = self._get_current_timestamp()
-            self._db.execute(self._UPSERT_SQL, [self._group_id, ekey, evalue, timestamp, timestamp])
-            self._db.commit()
-            self._logger.debug("upsert '%s'", key)
+
+            def _write(db: sqlite3.Connection) -> None:
+                self._logger.debug("upsert '%s'", key)
+                db.execute(self._UPSERT_SQL,
+                    [self._group_id, ekey, evalue, timestamp, timestamp])
+                return completion_callback
+
+            self._db_context.queue_write(_write)
         else:
             assert self.has_unique_keys()
-            if self._update(key, value) == 0:
-                self._add(key, value)
+
+            # We expect higher-level usageto  prevent overlapping reads and writes.
+            if self.get_value(key) is None:
+                self._add_many([ (key, value) ], completion_callback=completion_callback)
+            else:
+                self._update(key, value, completion_callback=completion_callback)
 
     @tprofiler
-    def update(self, key: str, value: bytes) -> int:
-        return self._update(key, value)
+    def update(self, key: str, value: bytes,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        self._update(key, value, completion_callback)
 
-    def _update(self, key: str, value: bytes) -> int:
+    def _update(self, key: str, value: bytes,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         assert type(value) is bytes
         ekey = self._encrypt_key(key)
         evalue = self._encrypt(value)
         timestamp = self._get_current_timestamp()
-        cursor = self._db.execute(self._UPDATE_SQL, [evalue, timestamp, self._group_id, ekey])
-        update_count = cursor.rowcount
-        self._db.commit()
-        self._logger.debug("updated '%s' for %d rows", key, update_count)
-        return update_count
+
+        def _write(db: sqlite3.Connection) -> None:
+            self._logger.debug("updated '%s'", key)
+            db.execute(self._UPDATE_SQL, [evalue, timestamp, self._group_id, ekey])
+            return completion_callback
+
+        self._db_context.queue_write(_write)
 
     @tprofiler
-    def update_many(self, entries: Iterable[Tuple[str, bytes]]) -> None:
+    def update_many(self, entries: Iterable[Tuple[str, bytes]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         timestamp = self._get_current_timestamp()
         datas = []
         for key, value in entries:
             assert type(value) is bytes
             datas.append(
                 [ self._encrypt(value), timestamp, self._group_id, self._encrypt_key(key) ])
-        self._db.executemany(self._UPDATE_SQL, datas)
-        self._db.commit()
-        self._logger.debug("update_many '%s'", list(t[0] for t in entries))
+
+        def _write(db: sqlite3.Connection) -> None:
+            self._logger.debug("update_many '%s'", list(t[0] for t in entries))
+            db.executemany(self._UPDATE_SQL, datas)
+            return completion_callback
+
+        self._db_context.queue_write(_write)
 
     @tprofiler
-    def delete(self, key: str) -> None:
+    def delete(self, key: str,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         ekey = self._encrypt_key(key)
         timestamp = self._get_current_timestamp()
-        self._db.execute(self._DELETE_SQL, [timestamp, self._group_id, ekey])
-        self._db.commit()
-        self._logger.debug("deleted '%s'", key)
+
+        def _write(db: sqlite3.Connection) -> None:
+            self._logger.debug("deleted '%s'", key)
+            db.execute(self._DELETE_SQL, [timestamp, self._group_id, ekey])
+            return completion_callback
+
+        self._db_context.queue_write(_write)
 
     @tprofiler
-    def delete_value(self, key: str, value: bytes) -> None:
+    def delete_value(self, key: str, value: bytes,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         ekey = self._encrypt_key(key)
         evalue = self._encrypt(value)
         timestamp = self._get_current_timestamp()
-        self._db.execute(self._DELETE_VALUE_SQL, [timestamp, self._group_id, ekey, evalue])
-        self._db.commit()
-        self._logger.debug("deleted value for '%s'", key)
+
+        def _write(db: sqlite3.Connection) -> None:
+            self._logger.debug("deleted value for '%s'", key)
+            db.execute(self._DELETE_VALUE_SQL, [timestamp, self._group_id, ekey, evalue])
+            return completion_callback
+
+        self._db_context.queue_write(_write)
 
     @tprofiler
-    def delete_values(self, entries: Iterable[Tuple[str, bytes]]) -> None:
+    def delete_values(self, entries: Iterable[Tuple[str, bytes]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         timestamp = self._get_current_timestamp()
         datas = []
         for key, value in entries:
             ekey = self._encrypt_key(key)
             evalue = self._encrypt(value)
             datas.append((timestamp, self._group_id, ekey, evalue))
-        self._db.executemany(self._DELETE_VALUE_SQL, datas)
-        self._db.commit()
-        self._logger.debug("deleted values for '%s'", [ v[0] for v in entries ])
+
+        def _write(db: sqlite3.Connection) -> None:
+            self._logger.debug("deleted values for '%s'", [ v[0] for v in entries ])
+            db.executemany(self._DELETE_VALUE_SQL, datas)
+            return completion_callback
+
+        self._db_context.queue_write(_write)
 
     def _delete_duplicates(self) -> None:
         self.execute_unsafe(f"""
@@ -638,10 +673,12 @@ class JSONKeyValueStore(StringKeyMixin, GenericKeyValueStore):
         db_value = self.get_value(key)
         return value if db_value is None else json.loads(db_value)
 
-    def set(self, key: str, value: Any) -> None:
+    def set(self, key: str, value: Any,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         if type(value) is not bytes:
             value = json.dumps(value).encode()
-        self.upsert(key, value)
+
+        self.upsert(key, value, completion_callback=completion_callback)
 
 
 StoreObject = Union[list, dict]
@@ -659,8 +696,14 @@ class ObjectKeyValueStore(GenericKeyValueStore):
     def _unpack_value(self, value: bytes) -> StoreObject:
         return json.loads(value.decode())
 
-    def add(self, key: str, value: StoreObject) -> None:
-        super().add(key, self._pack_value(value))
+    def add(self, key: str, value: StoreObject,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().add(key, self._pack_value(value), completion_callback=completion_callback)
+
+    def add_many(self, entries: List[Tuple[str, StoreObject]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        entries = [ (k, self._pack_value(v)) for (k, v) in entries ]
+        super().add_many(entries, completion_callback=completion_callback)
 
     def get_value(self, key: str) -> Optional[StoreObject]:
         byte_value = super().get_value(key)
@@ -678,14 +721,17 @@ class ObjectKeyValueStore(GenericKeyValueStore):
             return self._unpack_value(row[0]), row[1], row[2], row[3]
         return None
 
-    def set(self, key: str, value: StoreObject) -> None:
-        super().upsert(key, self._pack_value(value))
+    def set(self, key: str, value: StoreObject,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().upsert(key, self._pack_value(value), completion_callback=completion_callback)
 
-    def update(self, key: str, value: StoreObject) -> None:
-        super().update(key, self._pack_value(value))
+    def update(self, key: str, value: StoreObject,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().update(key, self._pack_value(value), completion_callback=completion_callback)
 
-    def delete_value(self, key: str, value: StoreObject) -> None:
-        super().delete_value(key, self._pack_value(value))
+    def delete_value(self, key: str, value: StoreObject,
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().delete_value(key, self._pack_value(value), completion_callback=completion_callback)
 
 
 class AbstractTransactionXput(ABC):
@@ -740,8 +786,10 @@ class TransactionInputStore(HexKeyMixin, EncryptedKeyMixin, GenericKeyValueStore
             return DBTxInput(address_string, prevout_tx_hash, prev_idx, amount)
         raise DataPackingError(f"Unhandled packing format {pack_version}")
 
-    def add_entries(self, entries: Iterable[Tuple[str, DBTxInput]]) -> None:
-        super().add_many([ (key, self._pack_value(value)) for (key, value) in entries ])
+    def add_entries(self, entries: Iterable[Tuple[str, DBTxInput]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().add_many([ (key, self._pack_value(value)) for (key, value) in entries ],
+            completion_callback=completion_callback)
 
     def get_entries(self, tx_id: str) -> List[DBTxInput]:
         values = super().get_values(tx_id)
@@ -756,8 +804,10 @@ class TransactionInputStore(HexKeyMixin, EncryptedKeyMixin, GenericKeyValueStore
             l.append(self._unpack_value(value))
         return d
 
-    def delete_entries(self, entries: Iterable[Tuple[str, DBTxInput]]) -> None:
-        super().delete_values([ (tx_id, self._pack_value(txin)) for (tx_id, txin) in entries ])
+    def delete_entries(self, entries: Iterable[Tuple[str, DBTxInput]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().delete_values([ (tx_id, self._pack_value(txin)) for (tx_id, txin) in entries ],
+            completion_callback=completion_callback)
 
 
 class DBTxOutput(namedtuple("DBTxOutputTuple", "address_string out_tx_n amount is_coinbase")):
@@ -794,8 +844,10 @@ class TransactionOutputStore(HexKeyMixin, EncryptedKeyMixin, GenericKeyValueStor
             return DBTxOutput(address_string, out_tx_n, amount, is_coinbase)
         raise DataPackingError(f"Unhandled packing format {pack_version}")
 
-    def add_entries(self, entries: Iterable[Tuple[str, DBTxOutput]]) -> None:
-        super().add_many([ (key, self._pack_value(value)) for (key, value) in entries ])
+    def add_entries(self, entries: Iterable[Tuple[str, DBTxOutput]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().add_many([ (key, self._pack_value(value)) for (key, value) in entries ],
+            completion_callback=completion_callback)
 
     def get_entries(self, tx_hash: str) -> List[DBTxOutput]:
         values = super().get_values(tx_hash)
@@ -810,8 +862,10 @@ class TransactionOutputStore(HexKeyMixin, EncryptedKeyMixin, GenericKeyValueStor
             l.append(self._unpack_value(value))
         return d
 
-    def delete_entries(self, entries: Iterable[Tuple[str, DBTxOutput]]) -> None:
-        super().delete_values([ (tx_id, self._pack_value(txout)) for (tx_id, txout) in entries ])
+    def delete_entries(self, entries: Iterable[Tuple[str, DBTxOutput]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
+        super().delete_values([ (tx_id, self._pack_value(txout)) for (tx_id, txout) in entries ],
+            completion_callback=completion_callback)
 
 
 class TxData(namedtuple("TxDataTuple", "height timestamp position fee")):
@@ -1277,7 +1331,8 @@ class TxXputCache(AbstractTransactionXput):
         self._cache = self._process_cache(cache_entries)
         self._logger.debug("Cached %s entries", name)
 
-    def add_entries(self, entries: Iterable[Tuple[str, tuple]]) -> None:
+    def add_entries(self, entries: Iterable[Tuple[str, tuple]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         new_entries = []
         for i, (tx_id, tx_xput) in enumerate(entries):
             cached_entries = self._cache.setdefault(tx_id, [])
@@ -1286,7 +1341,7 @@ class TxXputCache(AbstractTransactionXput):
                 cached_entries.append(tx_xput)
                 new_entries.append(entries[i])
         if len(new_entries):
-            self._store.add_entries(new_entries)
+            self._store.add_entries(new_entries, completion_callback=completion_callback)
 
     def get_entries(self, tx_id: str) -> List[tuple]:
         if tx_id not in self._cache:
@@ -1296,11 +1351,12 @@ class TxXputCache(AbstractTransactionXput):
     def get_all_entries(self) -> Dict[str, List[tuple]]:
         return self._cache.copy()
 
-    def delete_entries(self, entries: Iterable[Tuple[str, tuple]]) -> None:
+    def delete_entries(self, entries: Iterable[Tuple[str, tuple]],
+            completion_callback: Optional[CompletionCallbackType]=None) -> None:
         for tx_id, tx_xput in entries:
             cached_entries = self._cache[tx_id]
             cached_entries.remove(tx_xput)
-        self._store.delete_entries(entries)
+        self._store.delete_entries(entries, completion_callback=completion_callback)
 
     def _process_cache(self, cache: Dict[str, List[tuple]], verbose: Optional[bool]=False) -> None:
         new_cache = {}

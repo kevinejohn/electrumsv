@@ -101,16 +101,25 @@ class TestJSONKeyValueStore:
         cls.db_values.close()
         cls.db_context.close()
 
+    def setup_method(self) -> None:
+        self._completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self._completion_event.set()
+
     def test_get_nonexistent(self) -> None:
         assert self.db_values.get("nonexistent") is None
 
+    @pytest.mark.timeout(5)
     def test_upsert(self) -> None:
-        self.db_values.set("A", "B")
+        self.db_values.set("A", "B", completion_callback=self._completion_callback)
+        self._completion_event.wait()
         assert self.db_values.get("A") == "B"
 
-        self.db_values.set("A", "C")
+        self._completion_event.clear()
+        self.db_values.set("A", "C", completion_callback=self._completion_callback)
+        self._completion_event.wait()
         assert self.db_values.get("A") == "C"
-
         values = self.db_values.get_many_values([ "A" ])
         assert len(values) == 1
 
@@ -134,21 +143,30 @@ class TestGenericKeyValueStoreNonUnique:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
+        self._completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self._completion_event.set()
+
+    @pytest.mark.timeout(5)
     @pytest.mark.parametrize("variations,count", ((0, 0), (1, 3), (2, 3)))
     def test__delete_duplicates(self, variations, count) -> None:
+        entries = []
         for i in range(variations):
             k = os.urandom(10)
             v = os.urandom(10)
             for i in range(count):
-                self.store.add(k, v)
+                entries.append((k, v))
+        self.store.add_many(entries)
         # 1 other.
-        self.store.add(os.urandom(10), os.urandom(10))
-
+        self.store.add(os.urandom(10), os.urandom(10),
+            completion_callback=self._completion_callback)
+        self._completion_event.wait()
+        self._completion_event.clear()
         rows = self.store.get_all()
         assert len(rows) == (variations * count) + 1
 
         self.store._delete_duplicates()
-
         rows = self.store.get_all()
         assert len(rows) == variations + 1
 
@@ -172,12 +190,19 @@ class TestGenericKeyValueStore:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
+        self._completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self._completion_event.set()
+
+    @pytest.mark.timeout(5)
     def test_add(self):
         k = os.urandom(10)
         v = os.urandom(10)
 
         self.store.timestamp = 1
-        self.store.add(k, v)
+        self.store.add(k, v, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         row = self.store.get_row(k)
         assert row is not None
@@ -187,45 +212,55 @@ class TestGenericKeyValueStore:
         assert row[1] == row[2] # DateCreated == DateUpdated
         assert row[3] is None # DateDeleted
 
+    @pytest.mark.timeout(5)
     def test_add_many(self):
         kvs = [ (os.urandom(10), os.urandom(10)) for i in range(10) ]
 
         self.store.timestamp = 1
-        self.store.add_many(kvs)
+        self.store.add_many(kvs, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         kvs2 = self.store.get_many_values([ k for (k, v) in kvs ])
         assert len(kvs) == len(kvs2)
         for t in kvs:
             assert t in kvs2
 
+    @pytest.mark.timeout(5)
     def test_update_many(self) -> None:
         original_values = {}
         for i in range(10):
             k = os.urandom(10)
             v1 = os.urandom(10)
-            self.store.add(k, v1)
             original_values[k] = v1
+        entries = original_values.items()
+        self.store.add_many(entries, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         new_values = original_values.copy()
         for k in original_values.keys():
             new_values[k] = os.urandom(10)
-        self.store.update_many(new_values.items())
-
+        self._completion_event.clear()
+        self.store.update_many(new_values.items(), completion_callback=self._completion_callback)
+        self._completion_event.wait()
         rows = self.store.get_all()
         assert len(rows) == len(new_values)
         for row in rows:
             assert row[0] in new_values
 
+    @pytest.mark.timeout(5)
     def test_update(self):
         k = os.urandom(10)
         v1 = os.urandom(10)
 
         self.store.timestamp = 1
-        self.store.add(k, v1)
+        self.store.add(k, v1, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         v2 = os.urandom(10)
         self.store.timestamp = 2
-        self.store.update(k, v2)
+        self._completion_event.clear()
+        self.store.update(k, v2, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         row = self.store.get_row(k)
         assert row is not None
@@ -236,23 +271,29 @@ class TestGenericKeyValueStore:
         assert row[1] != row[2] # DateCreated != DateUpdated
         assert row[3] is  None # DateDeleted
 
+    @pytest.mark.timeout(5)
     def test_get(self):
         k = os.urandom(10)
         v = os.urandom(10)
-        self.store.add(k, v)
+        self.store.add(k, v, completion_callback=self._completion_callback)
+        self._completion_event.wait()
         byte_data = self.store.get_value(k)
         assert byte_data is not None
         assert byte_data == v
 
+    @pytest.mark.timeout(5)
     def test_delete(self):
         k = os.urandom(10)
         v = os.urandom(10)
 
         self.store.timestamp = 1
-        self.store.add(k, v)
+        self.store.add(k, v, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         self.store.timestamp = 2
-        self.store.delete(k)
+        self._completion_event.clear()
+        self.store.delete(k, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         row = self.store.get_row(k)
         assert row is not None
@@ -264,22 +305,28 @@ class TestGenericKeyValueStore:
         assert row[3] is not None # DateDeleted
         assert row[1] != row[3] # DateCreated != DateDeleted
 
+    @pytest.mark.timeout(5)
     def test_delete_value(self):
         k = os.urandom(10)
         v = os.urandom(10)
 
         self.store.timestamp = 1
-        self.store.add(k, v)
+        self.store.add(k, v, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         self.store.timestamp = 2
 
         # If the value is incorrect, the entry is untouched.
-        self.store.delete_value(k, os.urandom(10))
+        self._completion_event.clear()
+        self.store.delete_value(k, os.urandom(10), completion_callback=self._completion_callback)
+        self._completion_event.wait()
         row = self.store.get_row(k)
         assert row[3] is None # DateDeleted
 
         # If the value is correct, the entry is deleted.
-        self.store.delete_value(k, v)
+        self._completion_event.clear()
+        self.store.delete_value(k, v, completion_callback=self._completion_callback)
+        self._completion_event.wait()
         row = self.store.get_row(k)
         assert row is not None
         assert len(row) == 4
@@ -311,6 +358,11 @@ class TestObjectKeyValueStore:
         db.execute(f"DELETE FROM {self.store._table_name}")
         db.commit()
 
+        self._completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self._completion_event.set()
+
     def test__encrypt_key(self) -> None:
         v = self.store._encrypt_key("my_key")
         assert v == b'\xdaGh\xa5\xe95\x93z\xc3\xc7|\xd1\x904O\xee'
@@ -319,25 +371,29 @@ class TestObjectKeyValueStore:
         v = self.store._decrypt_key(b'\xdaGh\xa5\xe95\x93z\xc3\xc7|\xd1\x904O\xee')
         assert v == "my_key"
 
+    @pytest.mark.timeout(5)
     def test_get_all(self) -> None:
         added_entries = []
         for i in range(10):
             k = str(i)
             v = [ i ] * i
-            self.store.add(k, v)
             added_entries.append((k, v))
+        self.store.add_many(added_entries, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         all_entries = self.store.get_all()
         assert all_entries == added_entries
 
+    @pytest.mark.timeout(5)
     def test_get_row(self) -> None:
         d = {}
         for i in range(10):
             k = str(i)
             v = [ i ] * i
-            self.store.add(k, v)
             d[k] = v
-
+        entries = d.items()
+        self.store.add_many(entries, completion_callback=self._completion_callback)
+        self._completion_event.wait()
         row = self.store.get_row("5")
         assert row is not None
 
@@ -347,19 +403,24 @@ class TestObjectKeyValueStore:
         assert date_created == date_updated
         assert date_deleted is None
 
+    @pytest.mark.timeout(5)
     def test_update(self) -> None:
         d = {}
         for i in range(10):
             k = str(i)
             v = [ i ] * i
-            self.store.add(k, v)
             d[k] = v
+        entries = d.items()
+        self.store.add_many(entries, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         # Ensure that the update timestamp differs from the create timestamp.
         self.store.timestamp += 1
 
         new_value = [ 1,2,3,4,5 ]
-        self.store.update("5", new_value)
+        self._completion_event.clear()
+        self.store.update("5", new_value, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         for i in range(10):
             k = str(i)
@@ -378,18 +439,23 @@ class TestObjectKeyValueStore:
                 assert date_created == date_updated
             assert date_deleted is None
 
+    @pytest.mark.timeout(5)
     def test_delete_value(self) -> None:
         d = {}
         for i in range(10):
             k = str(i)
             v = [ i ] * i
-            self.store.add(k, v)
             d[k] = v
+        entries = d.items()
+        self.store.add_many(entries, completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         # Ensure that the update timestamp differs from the create timestamp.
         self.store.timestamp += 1
 
-        self.store.delete_value("5", d["5"])
+        self._completion_event.clear()
+        self.store.delete_value("5", d["5"], completion_callback=self._completion_callback)
+        self._completion_event.wait()
 
         for i in range(10):
             k = str(i)
@@ -1493,6 +1559,7 @@ class TestTxCache:
         assert their_entry.bytedata == bytedata
         assert their_entry.flags == flags
 
+    @pytest.mark.timeout(5)
     def test_get_height(self):
         cache = TxCache(self.store)
 
@@ -1510,6 +1577,7 @@ class TestTxCache:
         cache.update_flags(tx_id_1, TxFlags.StateReceived, TxFlags.HasByteData)
         assert cache.get_height(tx_id_1) is None
 
+    @pytest.mark.timeout(5)
     def test_get_unsynced_ids(self):
         cache = TxCache(self.store)
 
@@ -1556,6 +1624,7 @@ class TestTxCache:
         results = cache.get_unverified_entries(11)
         assert 1 == len(results)
 
+    @pytest.mark.timeout(5)
     def test_delete_reorged_entries(self) -> None:
         common_height = 5
         cache = TxCache(self.store)
@@ -1662,26 +1731,39 @@ class TestXputCache:
             db.execute(f"DELETE FROM {store._table_name}")
             db.commit()
 
+        self._completion_event = threading.Event()
+
+    def _completion_callback(self) -> None:
+        self._completion_event.set()
+
+    @pytest.mark.timeout(5)
     def test_cache_with_preload(self):
         tx_id = os.urandom(10).hex()
         tx_input = DBTxInput("address_string", "hash", 10, 10)
         tx_output = DBTxOutput("address_string", 10, 10, False)
 
         for tx_xput, tx_store in ((tx_input, self.txin_store), (tx_output, self.txout_store)):
-            tx_store.add_entries([ (tx_id, tx_xput) ])
+            tx_store.add_entries([ (tx_id, tx_xput) ],
+                completion_callback=self._completion_callback)
+            self._completion_event.wait()
+            self._completion_event.clear()
 
             cache = wallet_database.TxXputCache(tx_store, "teststore")
             assert tx_id in cache._cache
             assert 1 == len(cache._cache[tx_id])
             assert tx_xput == cache._cache[tx_id][0]
 
+    @pytest.mark.timeout(5)
     def test_cache_get_entries(self):
         tx_id = os.urandom(10).hex()
         tx_input = DBTxInput("address_string", "hash", 10, 10)
         tx_output = DBTxOutput("address_string", 10, 10, False)
 
         for tx_xput, tx_store in ((tx_input, self.txin_store), (tx_output, self.txout_store)):
-            tx_store.add_entries([ (tx_id, tx_xput) ])
+            tx_store.add_entries([ (tx_id, tx_xput) ],
+                completion_callback=self._completion_callback)
+            self._completion_event.wait()
+            self._completion_event.clear()
             cache = wallet_database.TxXputCache(tx_store, "teststore")
             entries = cache.get_entries(tx_id)
 
@@ -1692,6 +1774,7 @@ class TestXputCache:
         entries = cache.get_entries(reversed(tx_id))
         assert 0 == len(entries)
 
+    @pytest.mark.timeout(5)
     def test_cache_get_all_entries(self):
         all_tx_ids = []
         for i in range(5):
@@ -1701,7 +1784,10 @@ class TestXputCache:
             tx_output = DBTxOutput("address_string", 10, 10, False)
 
             for tx_xput, tx_store in ((tx_input, self.txin_store), (tx_output, self.txout_store)):
-                tx_store.add_entries([ (tx_id, tx_xput) ])
+                tx_store.add_entries([ (tx_id, tx_xput) ],
+                    completion_callback=self._completion_callback)
+                self._completion_event.wait()
+                self._completion_event.clear()
 
         for tx_xput, tx_store in ((tx_input, self.txin_store), (tx_output, self.txout_store)):
             cache = wallet_database.TxXputCache(tx_store, "teststore")
@@ -1713,6 +1799,7 @@ class TestXputCache:
                 expected_tx_ids.remove(entry_tx_id)
             assert len(expected_tx_ids) == 0
 
+    @pytest.mark.timeout(5)
     def test_cache_add(self):
         tx_id = os.urandom(10).hex()
         tx_input = DBTxInput("address_string", "hash", 10, 10)
@@ -1720,7 +1807,9 @@ class TestXputCache:
 
         for tx_xput, tx_store in ((tx_input, self.txin_store), (tx_output, self.txout_store)):
             cache = wallet_database.TxXputCache(tx_store, "teststore")
-            cache.add_entries([ (tx_id, tx_xput) ])
+            cache.add_entries([ (tx_id, tx_xput) ], completion_callback=self._completion_callback)
+            self._completion_event.wait()
+            self._completion_event.clear()
 
             # Check the caching layer has the entry.
             assert tx_id in cache._cache
@@ -1732,6 +1821,7 @@ class TestXputCache:
             assert 1 == len(entries)
             assert tx_xput == entries[0]
 
+    @pytest.mark.timeout(5)
     def test_cache_delete(self):
         tx_id = os.urandom(10).hex()
         tx_input = DBTxInput("address_string", "hash", 10, 10)
@@ -1739,8 +1829,13 @@ class TestXputCache:
 
         for tx_xput, tx_store in ((tx_input, self.txin_store), (tx_output, self.txout_store)):
             cache = wallet_database.TxXputCache(tx_store, "teststore")
-            cache.add_entries([ (tx_id, tx_xput) ])
-            cache.delete_entries([ (tx_id, tx_xput) ])
+            cache.add_entries([ (tx_id, tx_xput) ], completion_callback=self._completion_callback)
+            self._completion_event.wait()
+            self._completion_event.clear()
+            cache.delete_entries([ (tx_id, tx_xput) ],
+                completion_callback=self._completion_callback)
+            self._completion_event.wait()
+            self._completion_event.clear()
 
             # Check the caching layer no longer has the entry.
             assert 0 == len(cache._cache[tx_id])
@@ -1759,6 +1854,8 @@ class TestSqliteWriteDispatcher:
             def __enter__(self, *args, **kwargs):
                 pass
             def __exit__(self, *args, **kwargs):
+                pass
+            def execute(self, query: str) -> None:
                 pass
         class DbContext:
             def acquire_connection(self):
